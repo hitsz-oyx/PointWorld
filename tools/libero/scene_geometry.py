@@ -156,8 +156,17 @@ def estimate_normals_from_depth(points_world: np.ndarray,
 
 def get_body_pose(env, body_name: str) -> np.ndarray:
     """Return the 4x4 world-from-body transform for ``body_name`` at the
-    current sim timestep."""
-    body_id = env.sim.model.body_name2id(body_name)
+    current sim timestep. ``body_name`` is a ``str`` (not bytes) and
+    matches the keys in ``body_poses_per_t``."""
+    # ``body_name2id`` accepts str directly in mujoco 2.x.
+    if isinstance(body_name, str):
+        try:
+            body_id = env.sim.model.body_name2id(body_name)
+        except Exception:
+            # Some mujoco versions still want bytes; fall back.
+            body_id = env.sim.model.body_name2id(body_name.encode("utf-8"))
+    else:
+        body_id = env.sim.model.body_name2id(body_name)
     xpos = np.asarray(env.sim.data.body(body_id).xpos, dtype=np.float64)
     xmat = np.asarray(env.sim.data.body(body_id).xmat, dtype=np.float64).reshape(3, 3)
     T = np.eye(4, dtype=np.float64)
@@ -174,28 +183,61 @@ def list_robot_body_names(env) -> list[str]:
     ``robot0_`` prefix -- ``robot0_right_hand``, ``robot0_leftfinger``,
     ``robot0_rightfinger`` for the Panda -- and must therefore also be
     excluded from scene ownership.
+
+    All names are returned as ``str`` (not ``bytes``) to match the
+    decoded body names produced by ``get_per_pixel_bodies``.
     """
     out = []
     for i in range(env.sim.model.nbody):
         name = env.sim.model.body(i).name
+        if isinstance(name, bytes):
+            name = name.decode("utf-8", errors="ignore")
         if name and name.startswith("robot0_"):
             out.append(name)
     return out
 
 
 def get_gripper_body_names(env) -> list[str]:
-    """Return the names of the Panda gripper sub-bodies (hand + two fingers).
+    """Return the names of the Panda gripper / hand sub-bodies with visible
+    mesh.
 
-    LIBERO's Panda defines a palm / hand body and two finger bodies; they
-    carry the actual visible mesh, while the EEF body (``gripper0_eef``) is
-    only a reference frame. We want the visible ones for robot_flows.
+    LIBERO's Panda layout (verified by inspecting ``model.body_geomnum``
+    on a real ``libero_spatial`` BDDL scene):
+
+    * ``robot0_link7``   — 9 mesh geoms; carries the actual visible
+      **palm / hand** surface. ``robot0_right_hand`` is an empty kinematic
+      reference frame (``n_geoms == 0``) and is therefore *not* a gripper
+      body here.
+    * ``robot0_link6``   — 18 mesh geoms; carries the **wrist + finger
+      attachment** mesh. We include it as well so the resulting
+      ``robot_flows`` cloud has enough surface area to overlap with the
+      gripper region in the cameras.
+    * ``robot0_leftfinger`` / ``robot0_rightfinger`` — appear in
+      ``list_robot_body_names`` only for some robosuite Panda variants
+      (not this one); we still pick them up via the substring filter.
+
+    We filter out any candidate body whose ``n_geoms == 0`` (e.g. the
+    bare ``robot0_right_hand`` frame) so ``sample_gripper_mesh_points``
+    actually produces non-empty robot_flows.
     """
     out = []
     for name in list_robot_body_names(env):
         lname = name.lower()
         if "hand" in lname or "finger" in lname or "gripper" in lname:
             # Skip pure reference frames that carry no geom / mesh.
+            bid = env.sim.model.body_name2id(name)
+            if env.sim.model.body_geomnum[bid] == 0:
+                continue
             out.append(name)
+    # Add the wrist/hand links that don't match the substring filter but
+    # actually carry the visible hand mesh in the LIBERO Panda layout.
+    for name in list_robot_body_names(env):
+        if name in out:
+            continue
+        if name in ("robot0_link6", "robot0_link7"):
+            bid = env.sim.model.body_name2id(name)
+            if env.sim.model.body_geomnum[bid] > 0:
+                out.append(name)
     return out
 
 
@@ -245,6 +287,39 @@ def sample_gripper_mesh_points(env, body_names: Sequence[str], n_per_body: int =
         body_verts: list[np.ndarray] = []
         for g in range(geom_adr, geom_adr + n_geoms):
             if env.sim.model.geom_type[g] != mujoco.mjtGeom.mjGEOM_MESH:
+                # The Panda gripper visible surfaces are simple primitives
+                # (boxes for the hand, cylinders for the fingers), not
+                # mesh geoms. Synthesize a small cloud from the geom's
+                # own extents so the robot trajectory is non-empty.
+                gtype = env.sim.model.geom_type[g]
+                gsize = np.asarray(env.sim.model.geom_size[g], dtype=np.float64)
+                gpos = np.asarray(env.sim.model.geom_pos[g], dtype=np.float64)
+                gquat = np.asarray(env.sim.model.geom_quat[g], dtype=np.float64)
+                R_g = quat_wxyz_to_rotmat(gquat)
+                # Sample n_samp points on/inside the primitive in geom-local.
+                if gtype == mujoco.mjtGeom.mjGEOM_BOX:
+                    hs = gsize[:3]
+                    pts = rng.uniform(-hs, hs, size=(16, 3))
+                elif gtype == mujoco.mjtGeom.mjGEOM_CYLINDER:
+                    r, h, _ = gsize[0], gsize[1], gsize[2]
+                    theta = rng.uniform(0, 2 * np.pi, size=16)
+                    rr = r * np.sqrt(rng.uniform(0, 1, size=16))
+                    pts = np.stack(
+                        [rr * np.cos(theta), rr * np.sin(theta),
+                         rng.uniform(-h, h, size=16)],
+                        axis=-1,
+                    )
+                elif gtype == mujoco.mjtGeom.mjGEOM_SPHERE:
+                    r = gsize[0]
+                    # Uniformly sample on the sphere surface.
+                    v = rng.normal(size=(16, 3))
+                    v /= np.linalg.norm(v, axis=-1, keepdims=True) + 1e-12
+                    pts = v * r
+                else:
+                    # Unknown primitive: skip.
+                    continue
+                pts = pts @ R_g.T + gpos
+                body_verts.append(pts)
                 continue
             data_id = env.sim.model.geom_dataid[g]
             if data_id < 0:

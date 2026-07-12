@@ -74,7 +74,15 @@ def _default_argv(args: argparse.Namespace) -> list[str]:
         "robot_flows,robot_colors,robot_normals,gripper_open,robot_velocity,robot_acceleration",
         "--scene_features",
         "scene_flows,scene_colors,scene_normals,gripper_open,dist2robot",
-        "--domains", "",  # data-side, not used in inference
+        # Even in inference-only mode the Trainer must know which domains
+        # to load per-timestep normalization stats for. The released
+        # ``large-droid+behavior`` checkpoint was trained on two domains
+        # (DROID and BEHAVIOR), so the per-domain stat buffers in the
+        # model have shape (2, ...). Pass both so checkpoint loading
+        # matches the saved shape; the per-sample domain selector
+        # (``sample["__domain__"]``) still picks a single row.
+        "--domains", "droid,behavior",
+        "--norm_stats_path", args.norm_stats_path,
         "--log_dir", str(args.log_dir),
     ]
 
@@ -146,6 +154,15 @@ def _parse_args() -> argparse.Namespace:
                        "For the smoke test we alias LIBERO onto the released "
                        "'behavior' checkpoint (see docs/指导.md §十二)."
                    ))
+    p.add_argument(
+        "--norm_stats_path",
+        default="stats/droid_behavior",
+        help=(
+            "Folder containing precomputed per-domain normalization stats. "
+            "Defaults to ``stats/droid_behavior`` which matches the released "
+            "``large-droid+behavior`` checkpoint."
+        ),
+    )
     p.add_argument("--has_bimanual_robot", action="store_true", default=True,
                    help="Use bimanual feature layout (left slot = identity).")
     p.add_argument("--no_bimanual", dest="has_bimanual_robot", action="store_false",

@@ -35,6 +35,8 @@ This script does not import any PointWorld code; the only contract is the
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -46,7 +48,13 @@ import numpy as np
 # LIBERO / robosuite imports. These are only available in the LIBERO env.
 try:
     from libero.libero.envs import OffScreenRenderEnv  # type: ignore
-    from libero.libero.utils import env_utils as libero_env_utils
+    # The XML post-processing helper lives in libero.libero.utils.utils
+    # in the official LIBERO source; the previous ``env_utils`` name was
+    # a misnomer carried over from an older draft.
+    from libero.libero.utils import utils as libero_env_utils  # type: ignore
+    # Postprocess that also rewrites ``chiliocosm/assets`` paths (used by
+    # the official LIBERO recordings) to the local assets dir.
+    from libero.libero.envs import utils as libero_xml_postprocess  # type: ignore
 except ImportError as e:  # pragma: no cover - import error path
     print(
         "FATAL: this script must be run inside the LIBERO environment. "
@@ -54,6 +62,60 @@ except ImportError as e:  # pragma: no cover - import error path
         file=sys.stderr,
     )
     raise
+
+
+def _rewrite_libero_asset_paths(xml_str: str) -> str:
+    """Rewrite the absolute ``/Users/yifengz/.../chiliocosm/assets/...``
+    paths baked into the recorded XMLs to point at the assets dir of the
+    LIBERO source checkout on this machine. ``libero_env_utils.postprocess_model_xml``
+    only fixes the ``robosuite/...``-style paths and leaves
+    ``stable_scanned_objects``, ``turbosquid_objects``, etc. as absolute
+    paths that no longer resolve."""
+    import xml.etree.ElementTree as ET  # local import: not needed elsewhere
+    from libero.libero import get_libero_path
+
+    assets_dir = Path(get_libero_path("assets")).resolve()
+    if not assets_dir.is_dir():
+        return xml_str
+
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return xml_str
+
+    asset = root.find("asset")
+    if asset is None:
+        return xml_str
+
+    # Asset subfolders we know about. They are sibling subdirs of the
+    # assets dir, e.g. ``stable_scanned_objects/akita_black_bowl/...``.
+    subfolders = {
+        p.name for p in assets_dir.iterdir() if p.is_dir()
+    }
+
+    def _rewrite_path(old: str) -> str:
+        if old is None or os.path.isabs(old) and Path(old).is_file():
+            return old
+        # Find the first asset subfolder in the path. Everything from
+        # that subfolder onwards is mapped into our local assets dir.
+        parts = Path(old).parts
+        for i, part in enumerate(parts):
+            if part in subfolders:
+                rel = Path(*parts[i:])
+                candidate = assets_dir / rel
+                if candidate.is_file():
+                    return str(candidate)
+        return old
+
+    for elem in asset.findall("mesh") + asset.findall("texture"):
+        old = elem.get("file")
+        if old is None:
+            continue
+        new = _rewrite_path(old)
+        if new != old:
+            elem.set("file", new)
+
+    return ET.tostring(root, encoding="utf8").decode("utf8")
 
 from .sample_schema import (
     T_FRAMES,
@@ -83,12 +145,84 @@ from .scene_geometry import (
 # Environment construction from demo metadata.
 # ----------------------------------------------------------------------------
 
+def _resolve_bddl_for_demo(
+    demo_hdf5: str,
+    demo_group,
+    cli_bddl: str | None,
+    extra_search_dirs: list[str] | None,
+) -> str:
+    """Find the BDDL file for a demo.
+
+    Priority:
+    1. ``--bddl`` CLI flag (if provided and exists on disk).
+    2. ``env_args/bddl_file_name`` stored in the demo group (legacy
+       recording format produced by ``record_one_demo``).
+    3. The BDDL with the same stem as the HDF5, in any of the search
+       dirs (covers the real LIBERO dataset layout).
+    """
+    if cli_bddl is not None:
+        if not Path(cli_bddl).is_file():
+            raise FileNotFoundError(
+                f"--bddl {cli_bddl!r} was passed but does not exist on disk."
+            )
+        return str(Path(cli_bddl).resolve())
+
+    # (2) legacy in-HDF5 env_args
+    raw = demo_group.attrs.get("env_args", None)
+    if raw is not None:
+        if isinstance(raw, (str, bytes)):
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                parsed = {}
+        elif isinstance(raw, dict):
+            parsed = dict(raw)
+        else:
+            parsed = {}
+        candidate = parsed.get("bddl_file_name")
+        if candidate and Path(candidate).is_file():
+            return str(Path(candidate).resolve())
+
+    # (3) stem-based search across (a) the LIBERO bddl_files tree and
+    #     (b) any directories the user passed via --bddl_search_dir.
+    stem = Path(demo_hdf5).stem  # e.g. "..._demo"
+    if stem.endswith("_demo"):
+        stem = stem[: -len("_demo")]
+    candidate_names = [f"{stem}.bddl", f"{stem}.libero.bddl"]
+
+    search_dirs: list[str] = []
+    if extra_search_dirs:
+        search_dirs.extend(extra_search_dirs)
+    # The default LIBERO bddl_files layout, mirrored per suite.
+    bddl_root = "/home/u2023312616/test_ws/LIBERO/libero/libero/bddl_files"
+    if Path(bddl_root).is_dir():
+        for suite in Path(bddl_root).iterdir():
+            if suite.is_dir():
+                search_dirs.append(str(suite))
+
+    for d in search_dirs:
+        for name in candidate_names:
+            p = Path(d) / name
+            if p.is_file():
+                return str(p.resolve())
+
+    raise FileNotFoundError(
+        f"Could not locate a BDDL file for demo {Path(demo_hdf5).name!r}. "
+        f"Tried stems {candidate_names} in {search_dirs}. "
+        "Pass it explicitly via --bddl."
+    )
+
+
 def make_libero_env_from_demo(
     demo_hdf5: str,
     demo_id: str,
     camera_names: Sequence[str],
     height: int,
     width: int,
+    bddl: str | None = None,
+    bddl_search_dirs: list[str] | None = None,
 ):
     """Build a LIBERO env by reading ``model_file`` / ``env_args`` out of the
     demo HDF5 and replaying the canonical LIBERO reset_from_xml_string path.
@@ -102,23 +236,62 @@ def make_libero_env_from_demo(
     demo_group = f[f"data/{demo_id}"]
 
     if "model_file" not in demo_group.attrs:
-        f.close()
-        raise ValueError(
-            f"Demo group {demo_id} is missing the 'model_file' attribute. "
-            "This exporter requires a HDF5 file produced by a recent LIBERO."
-        )
-    model_file = demo_group.attrs["model_file"]
-    if isinstance(model_file, bytes):
-        model_file = model_file.decode("utf-8")
+        # Fall back to a "model_file" dataset if the XML is too large to
+        # fit as an attribute (HDF5 caps attributes at 64 KB). The recorded
+        # demo produced by ``tools.libero.record_one_demo`` uses this
+        # fallback for any non-trivial LIBERO scene.
+        if "model_file" in demo_group:
+            model_file = demo_group["model_file"][()]
+            if isinstance(model_file, bytes):
+                model_file = model_file.decode("utf-8")
+        else:
+            f.close()
+            raise ValueError(
+                f"Demo group {demo_id} is missing the 'model_file' "
+                "attribute and 'model_file' dataset. This exporter "
+                "requires a HDF5 file produced by a recent LIBERO."
+            )
+    else:
+        model_file = demo_group.attrs["model_file"]
+        if isinstance(model_file, bytes):
+            model_file = model_file.decode("utf-8")
     model_xml = libero_env_utils.postprocess_model_xml(model_file, {})
+    # The recorded XML also references ``chiliocosm/assets/...`` paths
+    # for the LIBERO-specific meshes; rewrite them to the local assets dir.
+    model_xml = _rewrite_libero_asset_paths(model_xml)
 
-    env_args = dict(demo_group.attrs.get("env_args", {}))
-    bddl_file = env_args.get("bddl_file_name")
+    raw_env_args = demo_group.attrs.get("env_args", None)
+    # ``env_args`` may be a JSON string (as written by
+    # ``tools.libero.record_one_demo``) rather than a real dict, depending
+    # on which tool produced the HDF5. Normalize to a dict.
+    if raw_env_args is None:
+        env_args = {}
+    elif isinstance(raw_env_args, (str, bytes)):
+        if isinstance(raw_env_args, bytes):
+            raw_env_args = raw_env_args.decode("utf-8")
+        try:
+            env_args = json.loads(raw_env_args)
+        except json.JSONDecodeError:
+            env_args = {}
+    elif isinstance(raw_env_args, dict):
+        env_args = dict(raw_env_args)
+    else:
+        env_args = {}
+
+    # Resolve the BDDL: prefer the explicit --bddl flag, then the in-HDF5
+    # env_args (legacy recording format), then the BDDL with the same stem
+    # as the HDF5 (real LIBERO dataset layout).
+    bddl_file = _resolve_bddl_for_demo(
+        demo_hdf5=demo_hdf5,
+        demo_group=demo_group,
+        cli_bddl=bddl,
+        extra_search_dirs=bddl_search_dirs,
+    )
     if bddl_file is None:
         f.close()
         raise ValueError(
-            f"Demo group {demo_id} is missing 'env_args/bddl_file_name'. "
-            "Pass the BDDL explicitly via the older flag path instead."
+            f"Demo group {demo_id} is missing 'env_args/bddl_file_name' "
+            "and no --bddl flag was provided. Pass --bddl explicitly."
         )
 
     env = OffScreenRenderEnv(
@@ -153,16 +326,28 @@ def get_per_pixel_bodies(env, seg_map: np.ndarray) -> tuple[np.ndarray, np.ndarr
     seg = seg_map.squeeze(-1).astype(np.int32)  # 1-based; 0 = no hit
     H, W = seg.shape
     nbody = env.sim.model.nbody
-    # Clip into valid range, then lookup; no-hit pixels will map to body 0
-    # (typically the world body) and we'll filter those out later.
-    safe = np.clip(seg - 1, -1, nbody - 1)
+    ngeom = env.sim.model.ngeom
+    # The segmentation channel from liberosuite's
+    # ``<cam>_segmentation_element`` is the **geom id + 1** (0 = no hit).
+    # We must clip into ``[0, ngeom - 1]`` to index ``model.geom_bodyid``;
+    # clipping into ``nbody`` (smaller!) used to silently collapse the
+    # body of every geom with id >= nbody onto the last body, which is
+    # why a LIBERO stove scene with 200+ geoms but fewer bodies used to
+    # come out as just "table" + "world".
+    safe = np.clip(seg - 1, -1, ngeom - 1)
     body_id = np.where(seg > 0, env.sim.model.geom_bodyid[safe] + 1, 0).astype(np.int32)
     body_name = np.empty((H, W), dtype=object)
     for b in range(nbody):
         mask = body_id == (b + 1)
         if not mask.any():
             continue
-        body_name[mask] = env.sim.model.body(b).name
+        # ``model.body(b).name`` is a ``bytes`` object in mujoco; decode
+        # it so it matches the ``str`` keys in ``body_poses_per_t`` and
+        # the ``robot_body_set`` membership checks downstream.
+        raw_name = env.sim.model.body(b).name
+        if isinstance(raw_name, bytes):
+            raw_name = raw_name.decode("utf-8", errors="ignore")
+        body_name[mask] = raw_name
     body_name[body_id == 0] = ""
     return body_id, body_name
 
@@ -396,6 +581,28 @@ def _parse_args() -> argparse.Namespace:
                    help="Demo group name inside the HDF5 (default: demo_0).")
     p.add_argument("--start_idx", type=int, required=True,
                    help="Index in the demo to use as the context frame.")
+    p.add_argument(
+        "--bddl",
+        default=None,
+        help=(
+            "Path to the BDDL file for this task. If omitted, the exporter "
+            "falls back to (a) the BDDL referenced inside the demo group's "
+            "env_args (legacy recording format) or (b) the BDDL with the "
+            "same stem as the HDF5 (real LIBERO dataset layout: "
+            "``<task>_demo.hdf5`` -> ``<task>.bddl``) found in the standard "
+            "BDDL search paths."
+        ),
+    )
+    p.add_argument(
+        "--bddl_search_dir",
+        action="append",
+        default=None,
+        help=(
+            "Additional directory to search for a BDDL file when the HDF5 "
+            "doesn't reference one. May be passed multiple times. Defaults "
+            "to the standard LIBERO ``bddl_files/{suite}/`` layout."
+        ),
+    )
     p.add_argument("--camera_names", nargs="+",
                    default=["agentview", "robot0_eye_in_hand"],
                    help="Camera names (default: agentview robot0_eye_in_hand).")
@@ -419,6 +626,8 @@ def main() -> None:
     env, h5_file, demo_group = make_libero_env_from_demo(
         args.demo_hdf5, args.demo_id, args.camera_names,
         args.camera_height, args.camera_width,
+        bddl=args.bddl,
+        bddl_search_dirs=args.bddl_search_dir,
     )
     try:
         actions = np.asarray(demo_group["actions"], dtype=np.float32)
@@ -444,6 +653,8 @@ def main() -> None:
         all_body_names = []
         for i in range(env.sim.model.nbody):
             name = env.sim.model.body(i).name
+            if isinstance(name, bytes):
+                name = name.decode("utf-8", errors="ignore")
             if name:
                 all_body_names.append(name)
 
