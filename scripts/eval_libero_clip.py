@@ -99,7 +99,13 @@ def _build_args(cli_args: argparse.Namespace):
 
 def compute_epe_metrics(pred_scene_flows: torch.Tensor,
                         gt_scene_flows: torch.Tensor) -> dict:
-    """Full-scene and moved-point EPE in meters."""
+    """Full-scene EPE in meters plus a "ever-moved" EPE over points whose
+    max over t of ||p^t - p^0||_2 exceeds 5 mm.
+
+    Note: this is *not* the same metric as PointWorld's official soft-movement
+    selector (which uses ||p^t - p^{t-1}|| with a 0.5 threshold). The two
+    should be clearly separated when comparing numbers.
+    """
     # pred_scene_flows, gt_scene_flows: (B, T, N, 3)
     err = torch.linalg.norm(pred_scene_flows[:, 1:] - gt_scene_flows[:, 1:], dim=-1)
 
@@ -107,13 +113,17 @@ def compute_epe_metrics(pred_scene_flows: torch.Tensor,
     gt_movement = torch.linalg.norm(gt_scene_flows[:, 1:] - gt_scene_flows[:, :1], dim=-1)
     moved_mask = (gt_movement.max(dim=1).values > 0.005)  # (B, N)
 
-    epe_all = err.mean().item()
-    err_masked = err[:, moved_mask]
-    epe_moved = err_masked.mean().item() if err_masked.numel() > 0 else float("nan")
+    epe_all_m = err.mean().item()
+
+    expanded_moved_mask = moved_mask[:, None, :].expand_as(err)
+    moved_err = err[expanded_moved_mask]
+    epe_ever_moved_m = (
+        moved_err.mean().item() if moved_err.numel() > 0 else float("nan")
+    )
 
     return {
-        "epe_all_m": float(epe_all),
-        "epe_moved_m": float(epe_moved),
+        "epe_all_m": float(epe_all_m),
+        "epe_ever_moved_m": float(epe_ever_moved_m),
         "n_moved_points": int(moved_mask.sum().item()),
         "n_total_points": int(moved_mask.numel()),
     }
@@ -200,8 +210,11 @@ def main() -> None:
     metrics["clip"] = str(cli_args.libero_clip)
     metrics["T"] = int(gt.shape[1])
     metrics["n_scene_points"] = int(gt.shape[2])
-    if "confidence" in outputs:
-        metrics["mean_confidence"] = float(outputs["confidence"].mean().item())
+    # NOTE: PointWorld overwrites log variance to a SIM_VAR_CONST for any
+    # domain whose name contains "behavior" (see BaseModel.forward), so
+    # outputs["confidence"] here is *not* a learned uncertainty. We do not
+    # report it; callers that want real confidence should use a DROID
+    # domain and the corresponding normalization.
 
     print(json.dumps(metrics, indent=2))
     if cli_args.out is not None:

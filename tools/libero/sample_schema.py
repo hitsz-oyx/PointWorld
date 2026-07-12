@@ -12,10 +12,24 @@ A single ``libero_clip.npz`` is the boundary between the LIBERO environment
 and the PointWorld model. The two pieces of code are not required to share a
 Python interpreter, only this file format.
 
-All arrays are float32 unless noted. Camera prefixes follow the PointWorld
-convention ``camera_<i>_*`` so the existing
-:func:`dataset_components.cameras.sample_cameras` can rename them to
-``cam0_*`` / ``cam1_*`` without modification.
+Conventions
+-----------
+* All arrays are float32 unless noted.
+* Camera prefixes follow the PointWorld convention ``camera_<i>_*`` so the
+  existing :func:`dataset_components.cameras.sample_cameras` can rename them
+  to ``cam0_*`` / ``cam1_*`` without modification.
+* Camera intrinsics ``camera_<i>_intrinsic`` are a 3x3 pinhole matrix in
+  OpenCV convention (cx = W/2, cy = H/2).
+* Camera extrinsics ``camera_<i>_extrinsic`` are a 4x4 **world-to-camera**
+  transform ``T_c_w`` -- i.e. applying the matrix to a homogeneous world
+  point gives the corresponding camera-frame point. This matches what
+  PointWorld's renderer expects in ``extr`` (see the ``@property`` of
+  :class:`dataset_components.scene_featurizer.PTRenderer`).
+
+    p_cam = T_c_w @ p_world
+
+  The exporter computes this by inverting the camera-to-world pose returned
+  by :func:`robosuite.utils.camera_utils.get_camera_extrinsic_matrix`.
 """
 
 from __future__ import annotations

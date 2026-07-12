@@ -17,24 +17,37 @@
 This module is the LIBERO-bound half of the LIBERO <-> PointWorld adapter. It
 exposes a small set of pure functions that:
 
+* look up camera intrinsics / extrinsics from the MuJoCo sim
+  (delegated to :mod:`robosuite.utils.camera_utils` to avoid reinventing the
+   OpenCV / MuJoCo axis correction),
+* convert the normalized depth buffer that robosuite exposes to a metric
+  distance map (:func:`get_real_depth`),
 * backproject RGB-D pixels into world coordinates (per-camera),
 * estimate per-point normals from depth,
 * look up body / camera poses from the MuJoCo sim at any timestep, and
 * track scene points across frames by binding them to their owning rigid body
-  at t=0 and re-applying that body's per-frame pose.
+  (which the LIBERO element-segmentation gives us exactly per pixel) and
+  re-applying that body's per-frame pose.
 
-The body ownership step is intentionally conservative for the smoke test: we
-assign each valid pixel to the nearest non-robot body whose bounding sphere
-contains the point. This is approximate but it does give the PointWorld model
-the right rigid-body correspondence structure, which is the property the
-adapter is trying to verify first.
+For the robot side this module also provides :func:`get_gripper_body_names`
+and :func:`sample_gripper_mesh_points` so the exporter can build a real
+Panda gripper surface trajectory (hand + two fingers) instead of the random
+sphere placeholder the first draft used.
 """
 
 from __future__ import annotations
 
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import numpy as np
+
+# robosuite utilities are imported lazily so this module can be loaded
+# inside the PointWorld env (no robosuite installed) for unit-testing the
+# pure-Python geometry helpers. The functions that need robosuite will
+# raise a clear error if it is not available.
+def _camera_utils():
+    from robosuite.utils import camera_utils  # type: ignore
+    return camera_utils
 
 
 # ----------------------------------------------------------------------------
@@ -42,50 +55,60 @@ import numpy as np
 # ----------------------------------------------------------------------------
 
 def get_camera_intrinsic(env, cam_name: str, height: int, width: int) -> np.ndarray:
-    """Build a 3x3 pinhole intrinsic from a MuJoCo camera definition.
+    """3x3 pinhole intrinsic from a MuJoCo camera definition (OpenCV: cx=W/2,
+    cy=H/2). Delegates to :func:`robosuite.utils.camera_utils` to match the
+    convention PointWorld's renderer expects."""
+    return _camera_utils().get_camera_intrinsic_matrix(
+        env.sim, cam_name, height, width
+    ).astype(np.float32)
 
-    MuJoCo stores the vertical FOV in degrees and assumes square pixels; we
-    derive focal length and principal point from that and the requested image
-    size.
+
+def get_camera_extrinsic_c_w(env, cam_name: str) -> np.ndarray:
+    """4x4 world-to-camera transform (``T_c_w``) for ``cam_name``.
+
+    The official :func:`robosuite.utils.camera_utils.get_camera_extrinsic_matrix`
+    returns the OpenCV-corrected camera-to-world pose; we invert it so the
+    stored extrinsic matches the ``p_cam = T_c_w @ p_world`` convention that
+    PointWorld's renderer uses.
     """
-    cam_id = env.sim.model.camera_name2id(cam_name)
-    fovy_deg = float(env.sim.model.cam_fovy[cam_id])
-    fovy_rad = np.deg2rad(fovy_deg)
-    fy = 0.5 * height / np.tan(0.5 * fovy_rad)
-    fx = fy
-    cx = 0.5 * (width - 1)
-    cy = 0.5 * (height - 1)
-    K = np.array([
-        [fx, 0.0, cx],
-        [0.0, fy, cy],
-        [0.0, 0.0, 1.0],
-    ], dtype=np.float32)
-    return K
+    T_w_c = _camera_utils().get_camera_extrinsic_matrix(env.sim, cam_name)
+    return np.linalg.inv(T_w_c).astype(np.float32)
 
 
-def get_camera_extrinsic(env, cam_name: str) -> np.ndarray:
-    """Return the 4x4 world-from-camera transform for ``cam_name``.
+def get_camera_extrinsic_w_c(env, cam_name: str) -> np.ndarray:
+    """4x4 camera-to-world transform (``T_w_c``) for ``cam_name``, OpenCV
+    axis convention. Used internally for things like camera position lookup
+    (e.g. for normal flipping)."""
+    return _camera_utils().get_camera_extrinsic_matrix(env.sim, cam_name).astype(np.float32)
 
-    ``cam_xmat`` is the rotation matrix that takes camera-frame vectors to
-    world-frame vectors; ``cam_xpos`` is the camera origin in world frame.
+
+# ----------------------------------------------------------------------------
+# Depth: convert robosuite normalized buffer to metric meters.
+# ----------------------------------------------------------------------------
+
+def get_real_depth(raw_depth: np.ndarray, sim) -> np.ndarray:
+    """Convert a (H, W) or (H, W, 1) normalized depth buffer to meters.
+
+    robosuite 1.4 returns the depth observable as ``(H, W, 1)`` from a
+    normalized ([0, 1]) MuJoCo depth buffer. Calling
+    :func:`robosuite.utils.camera_utils.get_real_depth_map` gives back the
+    actual distance in meters, which is what PointWorld's scene encoder
+    expects via the ``gt_depth`` field.
     """
-    cam_id = env.sim.model.camera_name2id(cam_name)
-    xpos = np.asarray(env.sim.data.cam_xpos[cam_id], dtype=np.float64)
-    xmat = np.asarray(env.sim.data.cam_xmat[cam_id], dtype=np.float64).reshape(3, 3)
-    T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = xmat
-    T[:3, 3] = xpos
-    return T
+    if raw_depth.ndim == 3:
+        raw_depth = raw_depth.squeeze(-1)
+    return _camera_utils().get_real_depth_map(sim, raw_depth.astype(np.float32)).astype(np.float32)
 
 
 # ----------------------------------------------------------------------------
 # Depth back-projection and normal estimation.
 # ----------------------------------------------------------------------------
 
-def backproject_depth(depth: np.ndarray, K: np.ndarray, T_w_c: np.ndarray) -> np.ndarray:
-    """Backproject a (H, W) depth image to (H, W, 3) world points.
+def backproject_depth(depth: np.ndarray, K: np.ndarray, T_c_w: np.ndarray) -> np.ndarray:
+    """Backproject a (H, W) metric depth image to (H, W, 3) world points.
 
-    ``T_w_c`` is a 4x4 world-from-camera transform. Returns float32.
+    ``T_c_w`` is the 4x4 world-to-camera transform (the schema convention).
+    Returns float32 world points.
     """
     depth = depth.astype(np.float32)
     H, W = depth.shape
@@ -98,10 +121,10 @@ def backproject_depth(depth: np.ndarray, K: np.ndarray, T_w_c: np.ndarray) -> np
     z_cam = depth
     pts_cam = np.stack([x_cam, y_cam, z_cam], axis=-1).reshape(-1, 3)
 
-    R = T_w_c[:3, :3].astype(np.float32)
-    t = T_w_c[:3, 3].astype(np.float32)
-    # pts_cam is (N, 3); we want (R @ p + t) per point.
-    pts_world = pts_cam @ R.T + t  # (N, 3)
+    # p_world = inv(T_c_w) @ p_cam.
+    R = T_c_w[:3, :3].astype(np.float32)
+    t = T_c_w[:3, 3].astype(np.float32)
+    pts_world = pts_cam @ R.T - (R.T @ t)  # (N, 3)
     return pts_world.reshape(H, W, 3)
 
 
@@ -143,62 +166,116 @@ def get_body_pose(env, body_name: str) -> np.ndarray:
     return T
 
 
-def list_non_robot_body_names(env, exclude_prefixes: Sequence[str] = ("robot0:",)) -> list[str]:
-    """Return all body names whose name does not start with any excluded prefix.
+def list_robot_body_names(env) -> list[str]:
+    """Return the names of all bodies that belong to any robot.
 
-    MuJoCo stores a world body (typically named ``"world"``) and parent
-    sub-bodies. We skip the world body and any robot-prefixed bodies by default.
+    robosuite prefixes robot bodies with ``robot{idx}_`` (e.g.
+    ``robot0_link0``). Some gripper sub-bodies are also under the
+    ``robot0_`` prefix -- ``robot0_right_hand``, ``robot0_leftfinger``,
+    ``robot0_rightfinger`` for the Panda -- and must therefore also be
+    excluded from scene ownership.
     """
     out = []
     for i in range(env.sim.model.nbody):
         name = env.sim.model.body(i).name
-        if not name:
-            continue
-        if name == "world":
-            continue
-        if any(name.startswith(p) for p in exclude_prefixes):
-            continue
-        out.append(name)
+        if name and name.startswith("robot0_"):
+            out.append(name)
     return out
 
 
-def find_owning_body(env, world_point: np.ndarray,
-                     candidate_bodies: Iterable[str]) -> str | None:
-    """Return the body whose bounding sphere contains ``world_point``.
+def get_gripper_body_names(env) -> list[str]:
+    """Return the names of the Panda gripper sub-bodies (hand + two fingers).
 
-    Falls back to the closest body within 0.5 m if no body's bounding sphere
-    actually contains the point (which can happen for points near edges).
-    Returns ``None`` if no candidate is within 0.5 m.
+    LIBERO's Panda defines a palm / hand body and two finger bodies; they
+    carry the actual visible mesh, while the EEF body (``gripper0_eef``) is
+    only a reference frame. We want the visible ones for robot_flows.
     """
-    best_name = None
-    best_signed = np.inf
-    for name in candidate_bodies:
-        body_id = env.sim.model.body_name2id(name)
-        xpos = np.asarray(env.sim.data.body(body_id).xpos, dtype=np.float64)
-        # rbound is the radius of the body's bounding sphere; 0 if body has
-        # no geoms (we treat that as 0.05 m so we still consider it).
-        rbound = float(env.sim.model.body(body_id).rbound)
-        r = rbound if rbound > 1e-6 else 0.05
-        dist = float(np.linalg.norm(world_point - xpos))
-        # Prefer a body whose sphere *contains* the point; among those pick
-        # the smallest residual (i.e. the tightest fit). If none contains,
-        # fall back to the closest.
-        if dist <= r and (r - dist) < best_signed:
-            best_signed = r - dist
-            best_name = name
-    if best_name is not None:
-        return best_name
+    out = []
+    for name in list_robot_body_names(env):
+        lname = name.lower()
+        if "hand" in lname or "finger" in lname or "gripper" in lname:
+            # Skip pure reference frames that carry no geom / mesh.
+            out.append(name)
+    return out
 
-    # Fallback: nearest candidate within 0.5 m.
-    best_dist = 0.5
-    for name in candidate_bodies:
-        body_id = env.sim.model.body_name2id(name)
-        xpos = np.asarray(env.sim.data.body(body_id).xpos, dtype=np.float64)
-        dist = float(np.linalg.norm(world_point - xpos))
-        if dist < best_dist:
-            best_dist = dist
-            best_name = name
-    return best_name
+
+# ----------------------------------------------------------------------------
+# Quat <-> rotmat helper.
+# ----------------------------------------------------------------------------
+
+def quat_wxyz_to_rotmat(quat: np.ndarray) -> np.ndarray:
+    """Convert a (4,) MuJoCo wxyz quaternion to a 3x3 rotation matrix."""
+    qw, qx, qy, qz = quat
+    # Normalize (MuJoCo quaternions are already unit-norm but be safe).
+    n = (qw * qw + qx * qx + qy * qy + qz * qz) ** 0.5 + 1e-12
+    qw, qx, qy, qz = qw / n, qx / n, qy / n, qz / n
+    R = np.array([
+        [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+        [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+        [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
+    ], dtype=np.float64)
+    return R
+
+
+# ----------------------------------------------------------------------------
+# Gripper mesh sampling.
+# ----------------------------------------------------------------------------
+
+def sample_gripper_mesh_points(env, body_names: Sequence[str], n_per_body: int = 64,
+                               seed: int = 0) -> tuple[np.ndarray, list[str]]:
+    """Sample points from the visible mesh of each gripper sub-body.
+
+    Returns:
+        (N, 3) float32 points in body-local coordinates, plus a list of
+        length N of the body name each point belongs to.
+    """
+    import mujoco
+
+    rng = np.random.RandomState(seed)
+    local_points: list[np.ndarray] = []
+    body_for_point: list[str] = []
+
+    for body_name in body_names:
+        body_id = env.sim.model.body_name2id(body_name)
+        n_geoms = env.sim.model.body_geomnum[body_id]
+        if n_geoms <= 0:
+            continue
+        geom_adr = env.sim.model.body_geomadr[body_id]
+
+        body_verts: list[np.ndarray] = []
+        for g in range(geom_adr, geom_adr + n_geoms):
+            if env.sim.model.geom_type[g] != mujoco.mjtGeom.mjGEOM_MESH:
+                continue
+            data_id = env.sim.model.geom_dataid[g]
+            if data_id < 0:
+                continue
+            vert_adr = int(env.sim.model.mesh_vertadr[data_id])
+            vert_num = int(env.sim.model.mesh_vertnum[data_id])
+            if vert_num == 0:
+                continue
+            verts = np.asarray(
+                env.sim.model.mesh_vert[vert_adr:vert_adr + vert_num],
+                dtype=np.float64,
+            ).copy()
+            # Vertices are stored in the geom's local frame; transform them
+            # into the body frame using geom_pos and geom_quat (wxyz).
+            geom_pos = np.asarray(env.sim.model.geom_pos[g], dtype=np.float64)
+            geom_quat = np.asarray(env.sim.model.geom_quat[g], dtype=np.float64)
+            R_g = quat_wxyz_to_rotmat(geom_quat)
+            verts = verts @ R_g.T + geom_pos
+            body_verts.append(verts)
+        if not body_verts:
+            continue
+        body_verts = np.concatenate(body_verts, axis=0)
+        if body_verts.shape[0] > n_per_body:
+            idx = rng.choice(body_verts.shape[0], n_per_body, replace=False)
+            body_verts = body_verts[idx]
+        local_points.append(body_verts.astype(np.float32))
+        body_for_point.extend([body_name] * body_verts.shape[0])
+
+    if not local_points:
+        return np.zeros((0, 3), dtype=np.float32), []
+    return np.concatenate(local_points, axis=0).astype(np.float32), body_for_point
 
 
 # ----------------------------------------------------------------------------
@@ -221,7 +298,6 @@ def track_points_through_poses(world_points_0: np.ndarray,
         (T, N, 3) world trajectory.
     """
     N = world_points_0.shape[0]
-    # Discover T from the cache: any key of body_poses_per_t has the time axis.
     if not body_poses_per_t:
         T = 1
     else:
@@ -268,10 +344,6 @@ def get_gripper_open(env, gripper_body_name: str = "gripper0_eef") -> float:
     mapping from joint position to openness is approximate; we only use this
     as a *feature* for the model, so any smooth [0, 1] signal works.
     """
-    # The Panda gripper in LIBERO has a finger joint called
-    # ``robot0_gripper_joint1`` (or ``gripper0_finger_joint1``) with a positive
-    # range. We pick the first joint whose name contains ``finger`` and
-    # belongs to the gripper body subtree.
     try:
         for jid in range(env.sim.model.njnt):
             name = env.sim.model.joint(jid).name
@@ -321,13 +393,17 @@ def _rotmat_to_quat_xyzw(R: np.ndarray) -> np.ndarray:
 
 __all__ = [
     "get_camera_intrinsic",
-    "get_camera_extrinsic",
+    "get_camera_extrinsic_c_w",
+    "get_camera_extrinsic_w_c",
+    "get_real_depth",
     "backproject_depth",
     "estimate_normals_from_depth",
     "get_body_pose",
-    "list_non_robot_body_names",
-    "find_owning_body",
+    "list_robot_body_names",
+    "get_gripper_body_names",
+    "sample_gripper_mesh_points",
     "track_points_through_poses",
     "get_gripper_pose",
     "get_gripper_open",
+    "quat_wxyz_to_rotmat",
 ]
