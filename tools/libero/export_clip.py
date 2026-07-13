@@ -46,7 +46,39 @@ import h5py
 import numpy as np
 
 # LIBERO / robosuite imports. These are only available in the LIBERO env.
+# IMPORTANT: this module MUST be imported with ``IMAGE_CONVENTION = "opencv"``
+# set on robosuite's global macro singleton. The LIBERO HDF5 demos are recorded
+# with the robosuite default (``"opengl"``), which means the depth/RGB/seg
+# sensors return images whose v-axis points up. Our K + T_c_w +
+# :func:`backproject_depth` all assume the OpenCV convention (v-down, y_cam
+# grows downward). If we do not flip the convention at the sensor layer, the
+# two cameras' y-coordinates end up pointing in opposite world-frame
+# directions, and the same physical surface gets rendered as two
+# misregistered clouds in the viewer (see ``docs/指导.md``). The flip has to
+# happen before the env is constructed because robosuite captures the
+# convention value inside the camera observable's closure at creation time.
 try:
+    # IMPORTANT: robosuite ships **two** different macros modules that
+    # both define ``IMAGE_CONVENTION = "opengl"``:
+    #   - ``robosuite.macros`` -- read by ``robosuite/environments/robot_env.py``
+    #     when the camera observable closure captures the convention value at
+    #     env-creation time. This is the one that actually controls whether
+    #     the depth/RGB/seg sensor returns an OpenCV-flipped image.
+    #   - ``robosuite.utils.macros`` -- an older duplicate that nobody reads
+    #     at runtime.
+    # The previous version of this script only set the *second* one, which
+    # silently had no effect. The camera observable kept using the OpenGL
+    # convention (``v=0`` is the bottom of the image), so the agentview and
+    # eye-in-hand pixel rows pointed in opposite world directions and the
+    # same physical table surface showed up at two different z in viser --
+    # the "two tables" symptom. Set **both** so the fix survives no matter
+    # which module future robosuite versions start reading.
+    import robosuite.macros as _rs_macros_pkg
+    import robosuite.utils.macros as _rs_macros_util
+
+    _rs_macros_pkg.IMAGE_CONVENTION = "opencv"
+    _rs_macros_util.IMAGE_CONVENTION = "opencv"
+
     from libero.libero.envs import OffScreenRenderEnv  # type: ignore
     # The XML post-processing helper lives in libero.libero.utils.utils
     # in the official LIBERO source; the previous ``env_utils`` name was
@@ -363,6 +395,12 @@ def make_libero_env_from_demo(
             "and no --bddl flag was provided. Pass --bddl explicitly."
         )
 
+    # Verify the convention value at the moment we hand the env to
+    # ``OffScreenRenderEnv``. The camera observable closure reads from
+    # ``robosuite.macros`` (not ``robosuite.utils.macros``), so check
+    # the one that actually controls rendering.
+    import robosuite.macros as _rs_macros_dbg  # type: ignore
+    print(f"[export_clip] robosuite.macros.IMAGE_CONVENTION at env create = {_rs_macros_dbg.IMAGE_CONVENTION}")
     env = OffScreenRenderEnv(
         bddl_file_name=bddl_file,
         camera_names=list(camera_names),
@@ -405,6 +443,15 @@ def capture_frame(env, camera_names: Sequence[str]):
     for cam in camera_names:
         rgb = np.asarray(obs[f"{cam}_image"], dtype=np.uint8)
         depth = get_real_depth(obs[f"{cam}_depth"], env.sim)
+        # DEBUG convention check
+        depth_sensor_raw = np.asarray(obs[f"{cam}_depth"], dtype=np.float32).squeeze(-1)
+        depth_sensor_metric = get_real_depth(obs[f"{cam}_depth"], env.sim)
+        if not hasattr(capture_frame, "_logged"):
+            capture_frame._logged = True
+            import robosuite.utils.macros as _m
+            print(f"[DEBUG] macros.IMAGE_CONVENTION = {_m.IMAGE_CONVENTION}")
+            print(f"[DEBUG] cam0 depth top (v=0, u=160): {depth_sensor_raw[0, 160]:.3f}, bot (v=179, u=160): {depth_sensor_raw[179, 160]:.3f}")
+            print(f"[DEBUG] cam0 metric depth top: {depth_sensor_metric[0, 160]:.3f}, bot: {depth_sensor_metric[179, 160]:.3f}")
         seg = np.asarray(obs[f"{cam}_segmentation_element"], dtype=np.int32)
         per_cam[cam] = (rgb, depth, seg)
     gripper_pose = get_gripper_pose(env)
@@ -662,8 +709,16 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument("--camera_names", nargs="+",
-                   default=["agentview", "robot0_eye_in_hand"],
-                   help="Camera names (default: agentview robot0_eye_in_hand).")
+                   default=["agentview", "birdview", "sideview",
+                            "frontview", "robot0_eye_in_hand"],
+                   help=(
+                       "Camera names to render. The default set uses every "
+                       "camera the official LIBERO XML ships with "
+                       "(``agentview``, ``birdview`` = top-down, ``sideview``, "
+                       "``frontview``, ``robot0_eye_in_hand``). Pick a smaller "
+                       "subset to speed up export, or pass custom names if you "
+                       "added new cameras to the XML via ``--extra_cameras``."
+                   ))
     p.add_argument("--camera_height", type=int, default=H_RELEASE)
     p.add_argument("--camera_width", type=int, default=W_RELEASE)
     p.add_argument("--gripper_eef_body", default="gripper0_eef",
