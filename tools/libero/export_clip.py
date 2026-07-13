@@ -134,9 +134,11 @@ from .scene_geometry import (
     get_gripper_body_names,
     get_gripper_open,
     get_gripper_pose,
+    get_per_pixel_bodies,
     get_real_depth,
     list_robot_body_names,
     sample_gripper_mesh_points,
+    snapshot_body_poses,
     track_points_through_poses,
 )
 
@@ -145,20 +147,36 @@ from .scene_geometry import (
 # Environment construction from demo metadata.
 # ----------------------------------------------------------------------------
 
+
+# ----------------------------------------------------------------------------
+# Environment construction from demo metadata.
+# ----------------------------------------------------------------------------
+
 def _resolve_bddl_for_demo(
     demo_hdf5: str,
+    f: "h5py.File",
     demo_group,
     cli_bddl: str | None,
     extra_search_dirs: list[str] | None,
 ) -> str:
     """Find the BDDL file for a demo.
 
-    Priority:
+    Priority
+    --------
     1. ``--bddl`` CLI flag (if provided and exists on disk).
-    2. ``env_args/bddl_file_name`` stored in the demo group (legacy
-       recording format produced by ``record_one_demo``).
-    3. The BDDL with the same stem as the HDF5, in any of the search
-       dirs (covers the real LIBERO dataset layout).
+    2. ``/data.attrs['bddl_file_name']`` (official LIBERO recording;
+       points to the original BDDL on the developer's machine; usually
+       not present on a clean checkout but checked first anyway).
+    3. ``/data.attrs['env_args']`` JSON — the official recording
+       format embeds the full env kwargs (including ``bddl_file_name``)
+       at the ``/data`` level rather than per-demo. We parse it here
+       for the BDDL hint, which is the only field the exporter needs
+       from it.
+    4. ``demo_group.attrs['env_args']`` (legacy ``record_one_demo``
+       recording).
+    5. The BDDL with the same stem as the HDF5, in any of the search
+       dirs (covers the real LIBERO dataset layout on a clean
+       checkout).
     """
     if cli_bddl is not None:
         if not Path(cli_bddl).is_file():
@@ -167,25 +185,34 @@ def _resolve_bddl_for_demo(
             )
         return str(Path(cli_bddl).resolve())
 
-    # (2) legacy in-HDF5 env_args
-    raw = demo_group.attrs.get("env_args", None)
-    if raw is not None:
-        if isinstance(raw, (str, bytes)):
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8")
-            try:
-                parsed = json.loads(raw)
-            except json.JSONDecodeError:
-                parsed = {}
-        elif isinstance(raw, dict):
-            parsed = dict(raw)
-        else:
-            parsed = {}
-        candidate = parsed.get("bddl_file_name")
-        if candidate and Path(candidate).is_file():
-            return str(Path(candidate).resolve())
+    # (2) and (3): /data attrs. The official LIBERO dataset writes
+    # ``bddl_file_name`` (sometimes a developer's local path) and
+    # ``env_args`` (a JSON dict) at the ``/data`` group level. We try
+    # ``bddl_file_name`` first because it is unambiguous, then fall
+    # back to ``env_args``.
+    data_group = f.get("data") if hasattr(f, "get") else None
+    if data_group is not None:
+        # (2)
+        for key in ("bddl_file_name",):
+            if key in data_group.attrs:
+                cand = data_group.attrs[key]
+                if isinstance(cand, bytes):
+                    cand = cand.decode("utf-8", errors="ignore")
+                if cand and Path(cand).is_file():
+                    return str(Path(cand).resolve())
+        # (3) parse env_args
+        if "env_args" in data_group.attrs:
+            cand = _parse_bddl_from_env_args(data_group.attrs["env_args"])
+            if cand and Path(cand).is_file():
+                return str(Path(cand).resolve())
 
-    # (3) stem-based search across (a) the LIBERO bddl_files tree and
+    # (4) legacy in-HDF5 env_args on the demo group
+    if "env_args" in demo_group.attrs:
+        cand = _parse_bddl_from_env_args(demo_group.attrs["env_args"])
+        if cand and Path(cand).is_file():
+            return str(Path(cand).resolve())
+
+    # (5) stem-based search across (a) the LIBERO bddl_files tree and
     #     (b) any directories the user passed via --bddl_search_dir.
     stem = Path(demo_hdf5).stem  # e.g. "..._demo"
     if stem.endswith("_demo"):
@@ -196,11 +223,23 @@ def _resolve_bddl_for_demo(
     if extra_search_dirs:
         search_dirs.extend(extra_search_dirs)
     # The default LIBERO bddl_files layout, mirrored per suite.
-    bddl_root = "/home/u2023312616/test_ws/LIBERO/libero/libero/bddl_files"
-    if Path(bddl_root).is_dir():
-        for suite in Path(bddl_root).iterdir():
-            if suite.is_dir():
-                search_dirs.append(str(suite))
+    # Allow overriding via the ``LIBERO_SRC`` env var (same convention
+    # as ``tools.libero.record_one_demo``) so the same exporter can
+    # be run on machines where LIBERO lives somewhere other than the
+    # hard-coded path. Falls back to the hard-coded path on this
+    # workstation.
+    libero_src = os.environ.get("LIBERO_SRC", "").strip()
+    bddl_root_candidates = []
+    if libero_src:
+        bddl_root_candidates.append(str(Path(libero_src) / "libero" / "bddl_files"))
+    bddl_root_candidates.append(
+        "/home/u2023312616/test_ws/LIBERO/libero/libero/bddl_files"
+    )
+    for bddl_root in bddl_root_candidates:
+        if Path(bddl_root).is_dir():
+            for suite in Path(bddl_root).iterdir():
+                if suite.is_dir():
+                    search_dirs.append(str(suite))
 
     for d in search_dirs:
         for name in candidate_names:
@@ -213,6 +252,34 @@ def _resolve_bddl_for_demo(
         f"Tried stems {candidate_names} in {search_dirs}. "
         "Pass it explicitly via --bddl."
     )
+
+
+def _parse_bddl_from_env_args(raw: object) -> str | None:
+    """Pull the ``bddl_file_name`` field out of an ``env_args`` attribute.
+
+    The HDF5 attr can be either a JSON string (as written by
+    :mod:`tools.libero.record_one_demo`) or a real ``dict`` (some
+    other LIBERO writers store it that way). We normalize to a dict
+    and return the candidate path; the caller still has to verify
+    it actually exists on disk.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, (str, bytes)):
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    elif isinstance(raw, dict):
+        parsed = dict(raw)
+    else:
+        return None
+    cand = parsed.get("bddl_file_name")
+    if isinstance(cand, bytes):
+        cand = cand.decode("utf-8", errors="ignore")
+    return cand if isinstance(cand, str) and cand else None
 
 
 def make_libero_env_from_demo(
@@ -278,11 +345,13 @@ def make_libero_env_from_demo(
     else:
         env_args = {}
 
-    # Resolve the BDDL: prefer the explicit --bddl flag, then the in-HDF5
-    # env_args (legacy recording format), then the BDDL with the same stem
-    # as the HDF5 (real LIBERO dataset layout).
+    # Resolve the BDDL: prefer the explicit --bddl flag, then the
+    # /data attrs (official LIBERO recordings), then the in-HDF5
+    # env_args (legacy recording format), then the BDDL with the same
+    # stem as the HDF5 (real LIBERO dataset layout on a clean checkout).
     bddl_file = _resolve_bddl_for_demo(
         demo_hdf5=demo_hdf5,
+        f=f,
         demo_group=demo_group,
         cli_bddl=bddl,
         extra_search_dirs=bddl_search_dirs,
@@ -310,46 +379,10 @@ def make_libero_env_from_demo(
 
 
 # ----------------------------------------------------------------------------
-# Per-pixel body ownership via element segmentation.
+# (Body ownership from element segmentation lives in scene_geometry.py
+#  so the unit test can mock ``env.sim.model`` without dragging in the
+#  libero package.)
 # ----------------------------------------------------------------------------
-
-def get_per_pixel_bodies(env, seg_map: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Convert a (H, W, 1) element-segmentation image to per-pixel body IDs
-    and body names.
-
-    Returns
-    -------
-    body_id : (H, W) int32
-        1-based body id per pixel. 0 = background / no hit.
-    body_name : (H, W) object array of strings
-    """
-    seg = seg_map.squeeze(-1).astype(np.int32)  # 1-based; 0 = no hit
-    H, W = seg.shape
-    nbody = env.sim.model.nbody
-    ngeom = env.sim.model.ngeom
-    # The segmentation channel from liberosuite's
-    # ``<cam>_segmentation_element`` is the **geom id + 1** (0 = no hit).
-    # We must clip into ``[0, ngeom - 1]`` to index ``model.geom_bodyid``;
-    # clipping into ``nbody`` (smaller!) used to silently collapse the
-    # body of every geom with id >= nbody onto the last body, which is
-    # why a LIBERO stove scene with 200+ geoms but fewer bodies used to
-    # come out as just "table" + "world".
-    safe = np.clip(seg - 1, -1, ngeom - 1)
-    body_id = np.where(seg > 0, env.sim.model.geom_bodyid[safe] + 1, 0).astype(np.int32)
-    body_name = np.empty((H, W), dtype=object)
-    for b in range(nbody):
-        mask = body_id == (b + 1)
-        if not mask.any():
-            continue
-        # ``model.body(b).name`` is a ``bytes`` object in mujoco; decode
-        # it so it matches the ``str`` keys in ``body_poses_per_t`` and
-        # the ``robot_body_set`` membership checks downstream.
-        raw_name = env.sim.model.body(b).name
-        if isinstance(raw_name, bytes):
-            raw_name = raw_name.decode("utf-8", errors="ignore")
-        body_name[mask] = raw_name
-    body_name[body_id == 0] = ""
-    return body_id, body_name
 
 
 # ----------------------------------------------------------------------------
@@ -390,9 +423,24 @@ def build_scene_trajectory(
     body_name_t0: np.ndarray,
     robot_body_set: set,
     body_poses_per_t: dict,
+    *,
+    K_t0: np.ndarray | None = None,
+    T_c_w_t0: np.ndarray | None = None,
+    T_w_c_t0: np.ndarray | None = None,
+    rgb_t0: np.ndarray | None = None,
 ) -> dict:
     """Build the per-camera scene payload from t=0 body ownership + per-frame
     body poses. Skips robot/gripper pixels entirely.
+
+    The frame-0 camera payload (``K_t0``, ``T_c_w_t0``, ``T_w_c_t0``,
+    ``rgb_t0``) is normally captured at the same sim state the depth at
+    ``depth_per_t[0]`` came from. After replaying ``T_FRAMES - 1`` more
+    steps, reading these from ``env`` would silently pick up the
+    **end-of-clip** camera pose -- which equals the frame-0 pose for a
+    fixed camera (e.g. ``agentview``) but is **wrong** for an
+    eye-in-hand camera that moves with the gripper. Pass them in
+    explicitly; the caller is responsible for capturing them at frame 0.
+    When omitted (legacy path) we read them from ``env`` and warn.
 
     Returns
     -------
@@ -402,16 +450,32 @@ def build_scene_trajectory(
     """
     T = len(depth_per_t)
     H, W = depth_per_t[0].shape
-    K = get_camera_intrinsic(env, camera_name, H, W)
-    T_c_w = get_camera_extrinsic_c_w(env, camera_name)
-    T_w_c = get_camera_extrinsic_w_c(env, camera_name)
+    if K_t0 is None or T_c_w_t0 is None or T_w_c_t0 is None or rgb_t0 is None:
+        print(
+            "WARNING: build_scene_trajectory falling back to env-supplied "
+            "frame-N camera payload. For eye-in-hand cameras this is the "
+            "end-of-clip pose, not the frame-0 pose. Pass K_t0 / T_c_w_t0 / "
+            "T_w_c_t0 / rgb_t0 explicitly to suppress this warning.",
+            file=sys.stderr,
+        )
+        K = get_camera_intrinsic(env, camera_name, H, W)
+        T_c_w = get_camera_extrinsic_c_w(env, camera_name)
+        T_w_c = get_camera_extrinsic_w_c(env, camera_name)
+        rgb0 = np.asarray(_get_obs(env)[f"{camera_name}_image"], dtype=np.uint8)
+    else:
+        K = K_t0
+        T_c_w = T_c_w_t0
+        T_w_c = T_w_c_t0
+        rgb0 = rgb_t0
     cam_pos = T_w_c[:3, 3]
 
     depth0 = depth_per_t[0]
     points_t0 = backproject_depth(depth0, K, T_c_w)  # (H, W, 3)
     normals_t0 = estimate_normals_from_depth(points_t0, cam_pos)
-    rgb0 = _get_obs(env)[f"{camera_name}_image"]
-    rgb0 = np.asarray(rgb0, dtype=np.uint8)
+    # ``rgb0`` was already resolved above (either cached by the caller or
+    # pulled from the env fallback). Don't re-fetch from ``env`` here:
+    # after the 10-step replay the env's current RGB is the end-of-clip
+    # RGB, not the frame-0 one.
 
     points_flat = points_t0.reshape(-1, 3)
     normals_flat = normals_t0.reshape(-1, 3)
@@ -488,10 +552,19 @@ def build_robot_trajectory(
     n_per_body: int = 64,
     seed: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Sample gripper mesh points in body-local frame at t=0, then track them
-    through the per-frame body poses. Returns (T, N, 3) world flows, normals,
-    and a magenta (T, N, 3) color array."""
-    local_points, body_for_point = sample_gripper_mesh_points(
+    """Sample gripper mesh points + surface normals in body-local frame
+    at t=0, then track them through the per-frame body poses.
+
+    Returns ``(T, N, 3)`` world flows, world normals (rotated by the
+    per-frame body rotation), and a magenta ``(T, N, 3)`` color array.
+
+    The surface normals are returned by ``sample_gripper_mesh_points``
+    (not re-derived from the body origin), so the model's
+    ``robot_normals`` feature matches the real surface geometry
+    instead of the radial-from-origin vector the previous
+    implementation produced (see docs/指导.md §P1-2).
+    """
+    local_points, normals_local, body_for_point = sample_gripper_mesh_points(
         env, gripper_body_names, n_per_body=n_per_body, seed=seed
     )
     if local_points.shape[0] == 0:
@@ -513,13 +586,6 @@ def build_robot_trajectory(
 
     if N == 0:
         return robot_flows, robot_normals, robot_colors
-
-    # Compute body-local normals (outward from the body's local origin; this
-    # is only a visual prior since the model uses normals as a feature).
-    body_origin = np.zeros(3, dtype=np.float32)
-    normals_local = local_points - body_origin
-    n = np.linalg.norm(normals_local, axis=-1, keepdims=True) + 1e-6
-    normals_local = normals_local / n
 
     for i, body in enumerate(body_for_point):
         T_b0 = body_poses_per_t.get((body, 0))
@@ -544,18 +610,10 @@ def build_robot_trajectory(
 
 
 # ----------------------------------------------------------------------------
-# Body pose snapshot helper.
+# Body pose snapshot helper lives in scene_geometry.py (moved there so the
+# unit test in tools/libero/tests/ can mock the libero deps). The import
+# at the top of this file re-exports it under the same name.
 # ----------------------------------------------------------------------------
-
-def snapshot_body_poses(env, body_names: list, t_idx: int, cache: dict) -> None:
-    """Fill ``cache[(body, t_idx)] = T_w_b`` for every body that still exists
-    in the current sim state. Bodies that disappeared (e.g. a removed object)
-    are simply skipped."""
-    for body in body_names:
-        try:
-            cache[(body, t_idx)] = get_body_pose(env, body)
-        except Exception:
-            continue
 
 
 # ----------------------------------------------------------------------------
@@ -639,10 +697,16 @@ def main() -> None:
                 f"{len(actions)} actions (need at least {T_FRAMES - 1} steps left)."
             )
 
-        # Reset sim to the chosen demo state, following the canonical LIBERO
-        # replay contract.
-        env.sim.set_state_from_flattened(states[args.start_idx])
-        env.sim.forward()
+        # ----------------------------------------------------------------
+        # Reset sim to the chosen demo state. We use LIBERO's
+        # ``regenerate_obs_from_state`` (the wrapper's official helper)
+        # rather than poking ``sim.set_state_from_flattened`` +
+        # ``sim.forward`` ourselves: robosuite's observables cache the
+        # last rendered frame, and a manual state set leaves that cache
+        # stale unless we ``_update_observables(force=True)``. Doing the
+        # force-update ourselves is exactly what this helper exists for.
+        # ----------------------------------------------------------------
+        env.regenerate_obs_from_state(states[args.start_idx])
 
         # ----------------------------------------------------------------
         # Identify bodies: scene vs robot.
@@ -661,7 +725,11 @@ def main() -> None:
         body_poses_per_t: dict[tuple[str, int], np.ndarray] = {}
 
         # ----------------------------------------------------------------
-        # Capture frame 0 (context).
+        # Capture frame 0 (context). Cache the per-camera camera payload
+        # at this point so the scene trajectory builder can backproject
+        # using frame-0 intrinsics / extrinsics, not the end-of-clip
+        # ones (matters for eye-in-hand cameras that move with the
+        # gripper).
         # ----------------------------------------------------------------
         per_cam0, gpose0, gopen0 = capture_frame(env, args.camera_names)
         depth_per_t: dict[str, list] = {c: [d for _, d, _ in [per_cam0[c]]]
@@ -669,20 +737,40 @@ def main() -> None:
         rgb0_per_cam: dict[str, np.ndarray] = {c: per_cam0[c][0] for c in args.camera_names}
         seg0_per_cam: dict[str, np.ndarray] = {c: per_cam0[c][2] for c in args.camera_names}
         body_name0_per_cam: dict[str, np.ndarray] = {}
+        K_t0_per_cam: dict[str, np.ndarray] = {}
+        T_c_w_t0_per_cam: dict[str, np.ndarray] = {}
+        T_w_c_t0_per_cam: dict[str, np.ndarray] = {}
         for c in args.camera_names:
             _, body_name = get_per_pixel_bodies(env, seg0_per_cam[c])
             body_name0_per_cam[c] = body_name
+            K_t0_per_cam[c] = get_camera_intrinsic(env, c, args.camera_height, args.camera_width)
+            T_w_c_t0_per_cam[c] = get_camera_extrinsic_w_c(env, c)
+            T_c_w_t0_per_cam[c] = get_camera_extrinsic_c_w(env, c)
 
         gripper_poses = [gpose0]
         gripper_opens = [gopen0]
         snapshot_body_poses(env, all_body_names, 0, body_poses_per_t)
 
         # ----------------------------------------------------------------
-        # Replay T_FRAMES - 1 more steps and snapshot.
+        # Replay T_FRAMES - 1 more steps and snapshot. After each step
+        # we also check the sim state against the recorded one
+        # (LIBERO's official ``regenerate_obs_from_state`` style
+        # "replay divergence" check). A non-trivial residual here means
+        # the env's internal dynamics / contact resolution diverged from
+        # the recorded demo, which would invalidate the per-frame body
+        # poses we just snapshotted.
         # ----------------------------------------------------------------
+        max_replay_err = 0.0
         for k in range(T_FRAMES - 1):
             action = actions[args.start_idx + k]
             env.step(action)
+            # Replay divergence check (see 指导.md §"另外两个小问题").
+            target_state = states[args.start_idx + k + 1]
+            current_state = env.sim.get_state().flatten()
+            err = float(np.linalg.norm(
+                current_state.astype(np.float64) - target_state.astype(np.float64)
+            ))
+            max_replay_err = max(max_replay_err, err)
             per_cam, gpose, gopen = capture_frame(env, args.camera_names)
             for c in args.camera_names:
                 _, depth, _ = per_cam[c]
@@ -690,6 +778,10 @@ def main() -> None:
             gripper_poses.append(gpose)
             gripper_opens.append(gopen)
             snapshot_body_poses(env, all_body_names, k + 1, body_poses_per_t)
+        print(
+            f"replay divergence: max state err over clip = {max_replay_err:.4f}",
+            file=sys.stderr,
+        )
 
         # ----------------------------------------------------------------
         # Build the in-memory sample.
@@ -702,6 +794,10 @@ def main() -> None:
             payload = build_scene_trajectory(
                 env, cam, depth_per_t[cam], body_name0_per_cam[cam],
                 robot_body_set, body_poses_per_t,
+                K_t0=K_t0_per_cam[cam],
+                T_c_w_t0=T_c_w_t0_per_cam[cam],
+                T_w_c_t0=T_w_c_t0_per_cam[cam],
+                rgb_t0=rgb0_per_cam[cam],
             )
             sample["scene_flows_per_cam"][prefix] = payload["scene_flows"]
             sample["scene_colors_per_cam"][prefix] = payload["scene_colors"]

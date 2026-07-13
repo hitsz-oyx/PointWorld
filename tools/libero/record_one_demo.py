@@ -31,7 +31,13 @@ import numpy as np
 # Locate the LIBERO source checkout so we can reuse its scripts/init_path
 # and its BDDL problem parser. The env variable is the only configuration
 # the user needs to provide; the default matches the env we just set up.
-_LIBERO_SRC = Path(__file__).resolve().parents[3] / "LIBERO"
+import os as _os
+_LIBERO_SRC = Path(
+    _os.environ.get(
+        "LIBERO_SRC",
+        Path(__file__).resolve().parents[3] / "LIBERO",
+    )
+)
 if not _LIBERO_SRC.is_dir():
     raise FileNotFoundError(
         f"Could not find LIBERO source at {_LIBERO_SRC}. "
