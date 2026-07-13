@@ -139,67 +139,6 @@ def _build_args(cli_args: argparse.Namespace):
 
 
 # ----------------------------------------------------------------------------
-# Robot-trajectory extrapolation for autoregressive rollout.
-# ----------------------------------------------------------------------------
-
-def _extrapolate_robot_traj(
-    robot_flows_orig: torch.Tensor,
-    robot_exists_orig: torch.Tensor,
-    mode: str = "linear",
-) -> torch.Tensor:
-    """Build an extrapolated/repeated robot trajectory for the autoregressive
-    rollout step. The model's condition is the *future* robot pose trajectory;
-    in the autoregressive loop we don't have the GT future, so we have to
-    synthesize one from the last few frames of the input clip.
-
-    Parameters
-    ----------
-    robot_flows_orig : (B, T, Nr, 3) tensor of robot point positions in the
-        centered frame (what the model sees).
-    robot_exists_orig : (B, T, Nr) bool tensor indicating which robot points
-        are valid at each frame.
-    mode : "linear" | "hold" | "repeat"
-        - "linear": extrapolate the last 3 frames of robot pose with constant
-          per-point velocity (position at t+k = position at t-1 + k * vel).
-          This is the default; it gives the model a plausible "the robot is
-          moving in a straight line" continuation.
-        - "hold": keep the last frame's pose constant for the entire future
-          trajectory. Good fallback if the last few input frames already
-          capture the desired motion and we want the model to "rest".
-        - "repeat": cycle the original T-frame trajectory. Useful when the
-          input clip already contains a full demonstration cycle and we want
-          the model to keep producing the same motion.
-
-    Returns
-    -------
-    (B, T, Nr, 3) tensor of the new "future" robot trajectory, in the same
-    shape and frame as ``robot_flows_orig``. ``robot_exists_orig`` is
-    unchanged.
-    """
-    B, T, Nr, _ = robot_flows_orig.shape
-    if mode == "hold":
-        # All future frames == the last frame.
-        return robot_flows_orig[:, -1:].expand(-1, T, -1, -1).contiguous()
-    if mode == "repeat":
-        return robot_flows_orig.clone()
-    # "linear": extrapolate the last 3 frames with constant velocity per point.
-    if T < 2:
-        return robot_flows_orig.clone()
-    # Use the last up-to-3 frames to estimate per-point velocity.
-    # ``vel[t, n] = (p[t] - p[t-1])`` averaged over the trailing window.
-    n_vel = min(3, T - 1)
-    diffs = robot_flows_orig[:, -n_vel:] - robot_flows_orig[:, -n_vel - 1:-1]  # (B, n_vel, Nr, 3)
-    vel = diffs.mean(dim=1)  # (B, Nr, 3) per-point constant velocity
-    # Build the future trajectory: at step k in [0, T), the per-point position
-    # is ``p[last] + (k+1) * vel`` (we use k+1 because at k=0 we are one
-    # step past ``last``).
-    last = robot_flows_orig[:, -1]  # (B, Nr, 3)
-    ks = torch.arange(1, T + 1, device=robot_flows_orig.device, dtype=robot_flows_orig.dtype)  # (T,)
-    new_traj = last.unsqueeze(1) + ks.view(1, T, 1, 1) * vel.unsqueeze(1)
-    return new_traj
-
-
-# ----------------------------------------------------------------------------
 # Metrics.
 # ----------------------------------------------------------------------------
 
@@ -284,14 +223,12 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help=(
-            "Number of autoregressive model calls. ``1`` (default) is the "
-            "single forward pass that predicts T future frames from the "
-            "11-frame clip. ``N > 1`` keeps feeding the predicted scene "
-            "back into the model to cover a longer horizon (~(N * (T-1) + "
-            "1) frames total). The robot's future trajectory is "
-            "linearly extrapolated from the last 3 frames of the clip "
-            "so the model has a plausible 'continuing action' to "
-            "condition on."
+            "Number of model calls. Only ``1`` is supported: one standard "
+            "PointWorld forward over a single 11-frame clip "
+            "(1 context + 10 predicted frames). Values > 1 were an "
+            "autoregressive experiment and are intentionally rejected "
+            "because they mix predicted scene geometry with stale RGB-D "
+            "and synthetic robot trajectories."
         ),
     )
     p.add_argument(
@@ -299,11 +236,8 @@ def _parse_args() -> argparse.Namespace:
         choices=["linear", "hold", "repeat"],
         default="linear",
         help=(
-            "How to construct the future robot trajectory passed to the "
-            "model in the autoregressive steps. ``linear`` (default) "
-            "extrapolates the last 3 frames of robot pose with constant "
-            "velocity; ``hold`` keeps the last frame's pose constant; "
-            "``repeat`` cycles the original 11-frame trajectory."
+            "Deprecated compatibility flag from the removed autoregressive "
+            "rollout path. Ignored when ``--rollout=1``."
         ),
     )
     return p.parse_args()
@@ -311,6 +245,12 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     cli_args = _parse_args()
+    if cli_args.rollout != 1:
+        raise ValueError(
+            "--rollout must be 1. Multi-step autoregressive rollout was "
+            "removed because it does not represent PointWorld's released "
+            "evaluation contract on LIBERO clips."
+        )
     # Resolve the per-domain stat buffer count from the checkpoint's
     # data contract before handing the CLI namespace to ``_build_args``
     # (which uses it to build the fake argv that the Trainer parser
@@ -385,137 +325,8 @@ def main() -> None:
     # report it; callers that want real confidence should use a DROID
     # domain and the corresponding normalization.
 
-    # ----------------------------------------------------------------
-    # Autoregressive rollout (--rollout N).
-    #
-    # The single forward pass above predicts T=11 future frames. The
-    # LIBERO demo trajectory is typically much longer (50-200 frames),
-    # so for visualization we want the model to keep predicting until
-    # the object is fully grasped / placed. We do this by feeding the
-    # model's last predicted scene back into the model as the new
-    # initial state, with an extrapolated / repeated robot trajectory
-    # to give the model a plausible "continuing action" to condition on.
-    #
-    # The output ``pred`` becomes (B, N * (T - 1) + 1, N_pts, 3); the
-    # intermediate "frame" at the end of each chunk is dropped to avoid
-    # duplicating it. We also extend ``gt`` to match (filled with the
-    # last available GT frame -- there is no ground truth for the
-    # extrapolated frames, but the user only looks at pred).
-    # ----------------------------------------------------------------
-    if cli_args.rollout > 1:
-        from dataset_components.collate import custom_collate_fn as _ccf
-        # Cache the inputs we need to rebuild the batch on each step.
-        # We re-use frame 0 of the original scene/robot features (the
-        # features at the actual t=0), which is a reasonable
-        # approximation; the model's per-point features are designed
-        # to be roughly stationary over the horizon we predict (the
-        # scene+robot geometry is the dominant signal).
-        scene_flows0 = batch["scene_flows"][:, 0].clone()  # (B, N, 3)
-        scene_features0 = batch["scene_features"][:, 0].clone()  # (B, N, F)
-        scene_exists0 = batch["scene_exists"][:, 0].clone()  # (B, N)
-        if "scene_visibility" in batch:
-            scene_visibility0 = batch["scene_visibility"][:, 0].clone()
-        else:
-            scene_visibility0 = None
-        # Robot: keep the full T-frame trajectory, but we'll replace
-        # it chunk-by-chunk in the loop.
-        robot_flows_orig = batch["robot_flows"].clone()  # (B, T, Nr, 3)
-        robot_features_orig = batch["robot_features"].clone()  # (B, T, Nr, Fr)
-        robot_exists_orig = batch["robot_exists"].clone()  # (B, T, Nr)
-        T_clip = int(gt.shape[1])
-
-        # Concatenate predictions across chunks. We keep the per-chunk
-        # pred so the file consumers can see the model "thinking"
-        # each time it sees its own output.
-        pred_chunks = [pred]  # (B, T, N, 3) each
-        gt_chunks = [gt]  # (B, T, N, 3) each
-        current_pred_last = pred[:, -1].clone()  # (B, N, 3) for next seed
-
-        for step in range(1, cli_args.rollout):
-            # ------------------------------------------------------------------
-            # Build the new batch: scene[:, 0] = last predicted,
-            # scene[:, 1:] = the previously-predicted frames (so the
-            # scene features have some temporal context). The robot
-            # trajectory is extrapolated from the last few frames.
-            # ------------------------------------------------------------------
-            new_batch = dict(batch)
-            # New scene_flows seed: pred[:, -1] (last predicted of previous chunk)
-            # Then for the remaining T-1 frames, use the trailing T-1
-            # predictions from the previous chunk so the model has
-            # context. (We hold the seed constant at frame 0 and
-            # propagate the trailing frames into frames 1..T-1.)
-            new_scene_flows = torch.cat(
-                [current_pred_last.unsqueeze(1), pred[:, 1:]], dim=1
-            )  # (B, T, N, 3)
-            new_batch["scene_flows"] = new_scene_flows
-            # Use the same scene features (frame 0) for all frames --
-            # an approximation, but the model's scene feature encoder
-            # is robust to small per-frame feature drift because the
-            # geometry (the scene_flows positions) is the dominant
-            # signal. Saves us from having to recompute normals /
-            # dist2robot on the predicted positions.
-            new_batch["scene_features"] = scene_features0.unsqueeze(1).expand(
-                -1, T_clip, -1, -1
-            ).contiguous()
-            new_batch["scene_exists"] = scene_exists0.unsqueeze(1).expand(
-                -1, T_clip, -1
-            ).contiguous()
-            if scene_visibility0 is not None:
-                new_batch["scene_visibility"] = scene_visibility0.unsqueeze(1).expand(
-                    -1, T_clip, -1
-                ).contiguous()
-            # Extrapolate the robot trajectory.
-            new_batch["robot_flows"] = _extrapolate_robot_traj(
-                robot_flows_orig, robot_exists_orig, mode=cli_args.robot_extrap_mode,
-            )
-            new_batch["robot_features"] = robot_features_orig  # reuse
-            new_batch["robot_exists"] = robot_exists_orig
-
-            with torch.inference_mode():
-                outputs_step = trainer.model(new_batch, training=False)
-            pred_step = outputs_step["scene_flows"]  # (B, T, N, 3)
-            # The first frame of pred_step is the identity (model
-            # convention); drop it so we can concatenate without
-            # duplicating. ``pred[:, 0] == scene_coord0``, which after
-            # the first rollout equals current_pred_last.
-            pred_chunks.append(pred_step[:, 1:])  # (B, T-1, N, 3)
-            # Update the seed: the last predicted position of this chunk
-            # is the *second-to-last* of pred_step (since pred_step[:, -1]
-            # is the model's prediction for its own frame 0, which is
-            # the same as current_pred_last).
-            current_pred_last = pred_step[:, -1].clone()
-            # No real GT for the extrapolated frames; pad with the last
-            # available GT frame so any consumer that expects
-            # ``len(gt) == len(pred)`` doesn't crash.
-            gt_chunks.append(
-                gt[:, -1:].expand(-1, T_clip - 1, -1, -1).contiguous()
-            )
-            print(
-                f"[eval_libero_clip] rollout step {step+1}/{cli_args.rollout} "
-                f"complete (pred shape now "
-                f"({sum(c.shape[1] for c in pred_chunks)}, {pred_chunks[0].shape[2]}, 3))",
-                file=sys.stderr,
-            )
-
-        # Concatenate predictions. Keep the first frame of the very
-        # first chunk (it's the model's t=0 identity, which equals the
-        # actual scene at t=0).
-        pred = torch.cat(pred_chunks, dim=1)  # (B, T + N*(T-1), N, 3)
-        gt = torch.cat(gt_chunks, dim=1)  # (B, T + N*(T-1), N, 3)
-        # EPE is only meaningful on the first chunk (where we have GT);
-        # we re-compute and report it on that slice for diagnostics.
-        first_chunk_pred = pred_chunks[0]
-        first_chunk_gt = gt_chunks[0]
-        chunk_metrics = compute_epe_metrics(first_chunk_pred, first_chunk_gt)
-        metrics["first_chunk_epe_all_m"] = chunk_metrics["epe_all_m"]
-        metrics["first_chunk_epe_ever_moved_m"] = chunk_metrics["epe_ever_moved_m"]
-        metrics["rollout_steps"] = int(cli_args.rollout)
-        metrics["T_total"] = int(pred.shape[1])
-        print(
-            f"[eval_libero_clip] autoregressive rollout complete: "
-            f"T_total = {pred.shape[1]} (T_clip={T_clip}, steps={cli_args.rollout})",
-            file=sys.stderr,
-        )
+    metrics["rollout_steps"] = 1
+    metrics["T_total"] = int(pred.shape[1])
 
     print(json.dumps(metrics, indent=2))
     if cli_args.out is not None:

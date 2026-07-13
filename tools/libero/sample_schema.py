@@ -43,10 +43,11 @@ CONTEXT_HORIZON = 1
 H_RELEASE = 180
 W_RELEASE = 320
 
-# Two cameras (agentview + eye-in-hand) match the PointWorld eval default
-# ``--eval_max_num_cameras 2`` and the BEHAVIOR single-arm setup.
+# Two fixed external cameras keep the PointWorld release contract simple:
+# the model still consumes exactly two views, but we avoid the moving
+# eye-in-hand camera that complicates rollout/evaluation semantics.
 DEFAULT_CAMERAS = ("camera_0", "camera_1")
-DEFAULT_CAMERA_NAMES = ("agentview", "robot0_eye_in_hand")
+DEFAULT_CAMERA_NAMES = ("birdview", "sideview")
 
 
 def _as_float32(x):
@@ -85,6 +86,7 @@ def empty_clip() -> dict:
             np.array([0, 0, 0, 0, 0, 0, 1], dtype=np.float32), (T_FRAMES, 1)
         ),
         "right_gripper_open": np.zeros((T_FRAMES, 1), dtype=np.float32),
+        "camera_names": np.array([], dtype=object),
         "point_object_names": np.array([], dtype=object),
     }
     return sample
@@ -126,6 +128,9 @@ def save_npz(sample: dict, path: str) -> None:
 
     # Metadata.
     flat["__key__"] = np.array(sample["__key__"], dtype=object)
+    flat["camera_names"] = np.array(
+        sample.get("camera_names", []), dtype=object
+    )
     flat["point_object_names"] = np.array(
         sample.get("point_object_names", []), dtype=object
     )
@@ -176,6 +181,11 @@ def load_npz(path: str) -> dict:
         "robot_colors": np.asarray(raw["robot_colors"], dtype=np.uint8),
         "right_gripper_pose": np.asarray(raw["right_gripper_pose"], dtype=np.float32),
         "right_gripper_open": np.asarray(raw["right_gripper_open"], dtype=np.float32),
+        "camera_names": (
+            list(raw["camera_names"])
+            if "camera_names" in raw.files
+            else []
+        ),
         "point_object_names": (
             list(raw["point_object_names"])
             if "point_object_names" in raw.files

@@ -49,6 +49,70 @@ def _quat_xyzw_to_wxyz(q: np.ndarray) -> np.ndarray:
     return np.array([qw, qx, qy, qz], dtype=np.float64)
 
 
+def _segment_stack(tracks: np.ndarray) -> np.ndarray:
+    """Convert (T, N, 3) trajectories into viser line segments."""
+    T, N, _ = tracks.shape
+    segs = np.empty((N * max(T - 1, 0), 2, 3), dtype=np.float32)
+    for i in range(T - 1):
+        s = i * N
+        segs[s:s + N, 0, :] = tracks[i]
+        segs[s:s + N, 1, :] = tracks[i + 1]
+    return segs
+
+
+def _compute_focus_indices(
+    gt_world: np.ndarray,
+    robot_flows: np.ndarray | None,
+    *,
+    movement_thresh_m: float = 0.01,
+    robot_radius_m: float = 0.12,
+    max_points: int = 512,
+) -> np.ndarray:
+    """Pick the manipulated-object subset from the model's 12k tracked points.
+
+    Heuristic:
+    - keep points that actually move over the 11-frame clip
+    - bias toward points that ever get close to the gripper
+    - if that still yields too many points, keep the most-moving ones
+    """
+    total_disp = np.linalg.norm(gt_world[1:] - gt_world[:1], axis=-1).max(axis=0)
+    moved = total_disp > float(movement_thresh_m)
+
+    near = np.ones_like(moved, dtype=bool)
+    min_robot_dist = np.full(gt_world.shape[1], np.inf, dtype=np.float32)
+    if robot_flows is not None and robot_flows.size:
+        for t in range(min(gt_world.shape[0], robot_flows.shape[0])):
+            pts = gt_world[t]  # (N, 3)
+            rob = robot_flows[t]  # (Nr, 3)
+            if rob.size == 0:
+                continue
+            # Chunk across scene points to keep memory bounded.
+            for start in range(0, pts.shape[0], 2048):
+                chunk = pts[start:start + 2048]
+                d = np.linalg.norm(chunk[:, None, :] - rob[None, :, :], axis=-1)
+                min_robot_dist[start:start + chunk.shape[0]] = np.minimum(
+                    min_robot_dist[start:start + chunk.shape[0]],
+                    d.min(axis=1).astype(np.float32),
+                )
+        near = min_robot_dist < float(robot_radius_m)
+
+    focus = moved & near
+    if not np.any(focus):
+        # Fallback: closest moving points, or just the strongest movers.
+        candidate = np.where(moved)[0]
+        if candidate.size == 0:
+            candidate = np.arange(gt_world.shape[1])
+        score = total_disp[candidate]
+        if np.isfinite(min_robot_dist).any():
+            score = score - 0.05 * min_robot_dist[candidate]
+        order = candidate[np.argsort(-score)]
+        return order[:max_points]
+
+    idx = np.where(focus)[0]
+    idx = idx[np.argsort(-total_disp[idx])]
+    return idx[:max_points]
+
+
 # --- Main viser app -------------------------------------------------------- #
 
 def build_app(
@@ -159,6 +223,10 @@ def build_app(
         pred is not None and "pred_scene_flows" in pred
     ) else "MODE: GT (input clip only, no model output)"
 
+    focus_idx = None
+    pred_world = None
+    gt_world = None
+
     with server.gui.add_folder("Clip controls"):
         t_slider = server.gui.add_slider(
             "frame t", min=0, max=T_max - 1, step=1, initial_value=0
@@ -166,10 +234,16 @@ def build_app(
         max_points = server.gui.add_slider(
             "max scene points (downsample)",
             min=500, max=min(50000, N), step=500,
-            initial_value=min(8000, N),
+            initial_value=min(3000, N),
+        )
+        show_dense_scene = server.gui.add_checkbox(
+            "show dense background", initial_value=(pred is None)
+        )
+        focus_on_active = server.gui.add_checkbox(
+            "focus on hand + object", initial_value=False
         )
         show_trails = server.gui.add_checkbox(
-            "show motion trails", initial_value=True
+            "show motion trails", initial_value=False
         )
         show_robot = server.gui.add_checkbox(
             "show gripper point cloud", initial_value=True
@@ -195,14 +269,14 @@ def build_app(
         # its *magnitude* is no longer to scale.
         flow_arrow_length = server.gui.add_slider(
             "flow arrow length multiplier",
-            min=1.0, max=50.0, step=0.5, initial_value=10.0,
+            min=1.0, max=80.0, step=1.0, initial_value=20.0,
         )
         # Thickness of the GT scene trails (and the predicted-flow
         # trails if --pred_npz is loaded). Default is generous because
         # the old 1.5-px lines were too thin to read in the dense union.
         trail_width = server.gui.add_slider(
             "trail line width",
-            min=1.0, max=6.0, step=0.5, initial_value=3.0,
+            min=1.0, max=8.0, step=0.5, initial_value=4.0,
         )
         # Subsampled-GT toggle lives in the "Predicted flow (vs GT)"
         # folder (so it's grouped with the other model-output controls)
@@ -277,15 +351,22 @@ def build_app(
         # and GT plus per_point_epe (T, N). We re-use the *input clip's*
         # per-point validity mask to decide which points to display, so
         # the overlay lines up with the GT cloud.
+        focus_idx = _compute_focus_indices(
+            gt_world,
+            robot_flows.astype(np.float32) if has_robot else None,
+        )
         pred_overlay = _build_predicted_overlay(
             server,
             pred_world,
             gt_world,
             pred["per_point_epe"].astype(np.float32),
+            focus_idx=focus_idx,
         )
+        focus_on_active.value = True
         print(
             f"predicted overlay loaded: pred shape {pred_world.shape}, "
-            f"per_point_epe shape {pred['per_point_epe'].shape}",
+            f"per_point_epe shape {pred['per_point_epe'].shape}, "
+            f"focus points={focus_idx.shape[0]}",
         )
         T_pred = pred_world.shape[0]
         T_max = max(T, T_pred)
@@ -302,7 +383,7 @@ def build_app(
         name="/scene",
         points=np.zeros((1, 3), dtype=np.float32),
         colors=np.zeros((1, 3), dtype=np.uint8),
-        point_size=0.005,
+        point_size=0.008,
     )
     robot_handle = server.scene.add_point_cloud(
         name="/robot",
@@ -361,7 +442,7 @@ def build_app(
             colors=np.full(
                 (1, 3), [120, 220, 120], dtype=np.uint8
             ),  # green
-            point_size=0.005,
+            point_size=0.009,
         )
         # Draw short GT trails for moving points (only those whose
         # per-frame displacement > 5mm) so the user can see how the
@@ -403,62 +484,42 @@ def build_app(
     flow_arrow_handle = None
     flow_arrow_segments_per_t: list[np.ndarray] = []
 
-    if show_trails.value:
-        # Scene trails: pick points whose max-frame displacement > 2mm.
-        # Lowered from the original 5mm so static-but-slightly-shifting
-        # points (e.g. the grasped bowl as it sits in the gripper) also
-        # show up; bumped the per-frame cap to 500 so the trails feel
-        # less sparse.
-        disp = np.linalg.norm(flows[1:] - flows[:1], axis=-1)  # (T-1, N)
-        per_pt_max = disp.max(axis=0)
+    # Scene trails / flow arrows: operate on the tracked GT subset when
+    # predictions are available, otherwise fall back to the dense union.
+    flow_source = gt_world if gt_world is not None else flows
+    disp = np.linalg.norm(flow_source[1:] - flow_source[:1], axis=-1)  # (T-1, N)
+    per_pt_max = disp.max(axis=0)
+    if focus_idx is not None:
+        moving = np.zeros(per_pt_max.shape[0], dtype=bool)
+        moving[focus_idx] = True
+        moving &= (per_pt_max > 0.002)
+    else:
         moving = valid[0] & (per_pt_max > 0.002)
-        if moving.any():
-            max_trails = 500
-            idxs = np.where(moving)[0]
-            if idxs.shape[0] > max_trails:
-                # Bias the downsample toward the *most* moving points so
-                # the static-but-moving bowl is over-represented in the
-                # trail set (otherwise the dense union overwhelms it).
-                sorted_idxs = idxs[np.argsort(-per_pt_max[idxs])]
-                idxs = sorted_idxs[:max_trails]
-            trails = flows[:, idxs, :]  # (T, n, 3)
-            n_pts = trails.shape[1]
-            segs = np.empty((n_pts * (T - 1), 2, 3), dtype=np.float32)
-            for i in range(T - 1):
-                segs[i * n_pts:(i + 1) * n_pts, 0, :] = trails[i]
-                segs[i * n_pts:(i + 1) * n_pts, 1, :] = trails[i + 1]
+    if moving.any():
+        max_trails = 500
+        idxs = np.where(moving)[0]
+        if idxs.shape[0] > max_trails:
+            sorted_idxs = idxs[np.argsort(-per_pt_max[idxs])]
+            idxs = sorted_idxs[:max_trails]
+        trails = flow_source[:, idxs, :]  # (T, n, 3)
+        if show_trails.value:
+            segs = _segment_stack(trails)
             scene_trail_handle = server.scene.add_line_segments(
                 name="/scene_trails",
                 points=segs,
                 colors=(80, 180, 255),
                 line_width=trail_width.value,
             )
-            # Pre-compute per-frame flow-arrow *direction* (unit
-            # displacement) for the same moving points. We store the
-            # *direction* rather than the actual endpoint so we can
-            # re-scale the arrow at render time with the
-            # ``flow_arrow_length`` slider -- some clips have per-frame
-            # motion of <2 mm which is invisible regardless of line
-            # width. ``flow_arrow_segments_per_t[t]`` is a (n_pts, 2, 3)
-            # array of segment endpoints; ``_update_frame`` uses the
-            # current multiplier + line width when pushing the data.
-            for tt in range(T - 1):
-                seg = np.stack([trails[tt], trails[tt + 1]], axis=1)
-                # Direction = endpoint - startpoint. Keep the raw delta
-                # so the user can see *which way* each point is going;
-                # the renderer multiplies it by the length slider.
-                flow_arrow_segments_per_t.append(seg)
+        for tt in range(T - 1):
+            seg = np.stack([trails[tt], trails[tt + 1]], axis=1)
+            flow_arrow_segments_per_t.append(seg)
 
     if has_robot and show_trails.value:
         disp_r = np.linalg.norm(robot_flows[1:] - robot_flows[:1], axis=-1)
         moving_r = (disp_r.max(axis=0) > 0.005)
         if moving_r.any():
             trails_r = robot_flows[:, moving_r, :]
-            n_pts = trails_r.shape[1]
-            segs = np.empty((n_pts * (T - 1), 2, 3), dtype=np.float32)
-            for i in range(T - 1):
-                segs[i * n_pts:(i + 1) * n_pts, 0, :] = trails_r[i]
-                segs[i * n_pts:(i + 1) * n_pts, 1, :] = trails_r[i + 1]
+            segs = _segment_stack(trails_r)
             robot_trail_handle = server.scene.add_line_segments(
                 name="/robot_trails",
                 points=segs,
@@ -499,7 +560,13 @@ def build_app(
 
         # --- Scene ----------------------------------------------------- #
         valid_t = valid[t_in_clip]
-        if not valid_t.any():
+        use_focus = bool(focus_on_active.value) and gt_world is not None and focus_idx is not None
+        if use_focus:
+            scene_handle.points = gt_world[t_in_clip, focus_idx, :]
+            scene_handle.colors = np.full(
+                (focus_idx.shape[0], 3), [90, 200, 120], dtype=np.uint8
+            )
+        elif not show_dense_scene.value or not valid_t.any():
             scene_handle.points = np.zeros((0, 3), dtype=np.float32)
             scene_handle.colors = np.zeros((0, 3), dtype=np.uint8)
         else:
@@ -519,7 +586,10 @@ def build_app(
         # this exactly; rendering both makes the alignment obvious.
         if gt_world_handle is not None and show_subsampled_gt.value:
             gt_t_in_clip = min(t, gt_world.shape[0] - 1)
-            gt_world_handle.points = gt_world[gt_t_in_clip]
+            if use_focus:
+                gt_world_handle.points = gt_world[gt_t_in_clip, focus_idx, :]
+            else:
+                gt_world_handle.points = gt_world[gt_t_in_clip]
             gt_world_handle.visible = True
         elif gt_world_handle is not None:
             gt_world_handle.visible = False
@@ -630,6 +700,9 @@ def build_app(
             # ``pred_world`` was already corrected for the model's
             # ``center_shift`` at the top of ``build_app``.
             pred_t = pred_world[t]  # (N_p, 3) in world frame
+            if use_focus:
+                pred_t = pred_t[focus_idx]
+                frame_epe = frame_epe[focus_idx]
             N_p = pred_t.shape[0]
             n_cap = int(max_points.value)
             if N_p > n_cap:
@@ -688,6 +761,14 @@ def build_app(
 
     @max_points.on_update
     def _on_max(_evt) -> None:
+        _update_frame(int(t_slider.value))
+
+    @show_dense_scene.on_update
+    def _on_dense(_evt) -> None:
+        _update_frame(int(t_slider.value))
+
+    @focus_on_active.on_update
+    def _on_focus(_evt) -> None:
         _update_frame(int(t_slider.value))
 
     @show_trails.on_update
@@ -782,6 +863,7 @@ def _build_predicted_overlay(
     pred_flows: np.ndarray,
     gt_flows: np.ndarray,
     per_point_epe: np.ndarray,
+    focus_idx: np.ndarray | None = None,
 ) -> tuple:
     """Build a (predicted point cloud, predicted trajectory segments,
     EPE slider, show_pred checkbox) tuple.
@@ -790,6 +872,13 @@ def _build_predicted_overlay(
     handles let the caller hide / show the predicted overlay and tune
     the EPE colormap upper bound interactively.
     """
+    if focus_idx is not None:
+        pred_flows = pred_flows[:, focus_idx, :]
+        gt_flows = gt_flows[:, focus_idx, :]
+        if per_point_epe.ndim == 2:
+            per_point_epe = per_point_epe[:, focus_idx]
+        else:
+            per_point_epe = per_point_epe[focus_idx]
     T_p, N_p, _ = pred_flows.shape
     # Per-point EPE colormap. EPE is the per-point magnitude of
     # ``pred - gt`` at the final frame; we use that as the colormap
@@ -838,22 +927,18 @@ def _build_predicted_overlay(
         name="/pred",
         points=np.zeros((1, 3), dtype=np.float32),
         colors=np.zeros((1, 3), dtype=np.uint8),
-        point_size=0.006,
+        point_size=0.010,
     )
     # Predicted trajectory: for each point, draw a polyline through
     # all 11 frames. We pack it as T-1 line segments per point.
     n_segs = N_p * (T_p - 1)
     if n_segs > 0:
-        seg_pts = np.empty((n_segs, 2, 3), dtype=np.float32)
-        for tt in range(T_p - 1):
-            s = tt * N_p
-            seg_pts[s:s + N_p, 0, :] = pred_flows[tt]
-            seg_pts[s:s + N_p, 1, :] = pred_flows[tt + 1]
+        seg_pts = _segment_stack(pred_flows)
         pred_seg_handle = server.scene.add_line_segments(
             name="/pred_traj",
             points=seg_pts,
             colors=(255, 220, 80),  # yellow
-            line_width=2.0,
+            line_width=3.5,
         )
     else:
         pred_seg_handle = None
@@ -866,7 +951,7 @@ def _build_predicted_overlay(
         name="/pred_markers",
         points=np.zeros((1, 3), dtype=np.float32),
         colors=np.zeros((1, 3), dtype=np.uint8),
-        point_size=0.012,
+        point_size=0.014,
     )
 
     return (

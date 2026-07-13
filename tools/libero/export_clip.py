@@ -150,6 +150,7 @@ def _rewrite_libero_asset_paths(xml_str: str) -> str:
     return ET.tostring(root, encoding="utf8").decode("utf8")
 
 from .sample_schema import (
+    DEFAULT_CAMERA_NAMES,
     T_FRAMES,
     H_RELEASE,
     W_RELEASE,
@@ -709,15 +710,13 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument("--camera_names", nargs="+",
-                   default=["agentview", "birdview", "sideview",
-                            "frontview", "robot0_eye_in_hand"],
+                   default=list(DEFAULT_CAMERA_NAMES),
                    help=(
-                       "Camera names to render. The default set uses every "
-                       "camera the official LIBERO XML ships with "
-                       "(``agentview``, ``birdview`` = top-down, ``sideview``, "
-                       "``frontview``, ``robot0_eye_in_hand``). Pick a smaller "
-                       "subset to speed up export, or pass custom names if you "
-                       "added new cameras to the XML via ``--extra_cameras``."
+                       "Camera names to render. Defaults to the fixed "
+                       "external pair ``birdview sideview`` so exported clips "
+                       "match the intended 2-camera evaluation setup without "
+                       "introducing moving wrist-camera geometry. Pass a "
+                       "different subset if you need a custom export."
                    ))
     p.add_argument("--camera_height", type=int, default=H_RELEASE)
     p.add_argument("--camera_width", type=int, default=W_RELEASE)
@@ -843,6 +842,7 @@ def main() -> None:
         # ----------------------------------------------------------------
         sample = empty_clip()
         sample["__key__"] = f"{args.demo_id}-{args.start_idx}:{args.start_idx + T_FRAMES - 1}"
+        sample["camera_names"] = np.asarray(args.camera_names, dtype=object)
 
         for i, cam in enumerate(args.camera_names):
             prefix = f"camera_{i}"
