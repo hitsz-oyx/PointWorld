@@ -42,7 +42,7 @@ import numpy as np
 import torch
 
 from arguments import parse_args
-from dataset_components.cameras import sample_cameras
+from dataset_components.cameras import select_cameras_in_order
 from dataset_components.collate import custom_collate_fn
 from dataset_components.pipeline import apply_release_pipeline_to_sample
 from dataset_components.robot import canonicalize_gripper_keys_and_flags
@@ -131,11 +131,28 @@ def _build_args(cli_args: argparse.Namespace):
     # Force inference-only knobs that parse_args does not set.
     args.exp_name = cli_args.exp_name
     args.batch_size = 1
-    args.eval_min_num_cameras = 2
-    args.eval_max_num_cameras = 2
-    args.train_min_num_cameras = 2
-    args.train_max_num_cameras = 2
+    num_cameras = int(getattr(cli_args, "num_cameras", 3))
+    args.eval_min_num_cameras = num_cameras
+    args.eval_max_num_cameras = num_cameras
+    args.train_min_num_cameras = num_cameras
+    args.train_max_num_cameras = num_cameras
     return args
+
+
+def _selected_camera_metadata(sample: dict) -> tuple[list[str], list[str]]:
+    prefixes = [
+        str(x) for x in np.asarray(
+            sample.get("__selected_camera_prefixes__", []),
+            dtype=object,
+        ).tolist()
+    ]
+    names = [
+        str(x) for x in np.asarray(
+            sample.get("camera_names", []),
+            dtype=object,
+        ).tolist()
+    ]
+    return prefixes, names
 
 
 # ----------------------------------------------------------------------------
@@ -185,6 +202,16 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--libero_clip", required=True,
                    help="Path to a clip .npz produced by tools.libero.export_clip.")
     p.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
+    p.add_argument(
+        "--num_cameras",
+        type=int,
+        choices=[1, 2, 3],
+        default=3,
+        help=(
+            "Number of exported cameras to evaluate in on-disk order. "
+            "Default 3 uses frontview, sideview, and birdview."
+        ),
+    )
     p.add_argument("--model_domain", default="behavior",
                    help=(
                        "Domain name to use for normalization stats lookup. "
@@ -271,14 +298,16 @@ def main() -> None:
     sample = flatten_for_pointworld(raw)
     sample["__domain__"] = cli_args.model_domain
 
-    # Deterministic camera selection: always pick both cameras in order.
-    sample = sample_cameras(
+    # Release-style LIBERO clips already export the intended fixed camera
+    # order as ``camera_0``, ``camera_1``, ... (frontview, sideview, then
+    # birdview by default). Keep that order here instead of running the generic random
+    # camera sampler, which would otherwise permute the two fixed views and
+    # change which duplicate voxel survives test-time grid sampling.
+    sample = select_cameras_in_order(
         sample,
-        min_num_cameras=2,
-        max_num_cameras=2,
-        deterministic=True,
-        seed=42,
+        num_cameras=cli_args.num_cameras,
     )
+    selected_camera_prefixes, selected_camera_names = _selected_camera_metadata(sample)
 
     # Fill in left/right gripper slots (left = identity by canonicalize).
     sample = canonicalize_gripper_keys_and_flags(sample)
@@ -289,6 +318,7 @@ def main() -> None:
         mode="test",
         args=args,
         has_bimanual_robot=cli_args.has_bimanual_robot,
+        include_scene_data=(cli_args.out_pred_npz is not None),
     )
 
     # ----------------------------------------------------------------
@@ -319,6 +349,8 @@ def main() -> None:
     metrics["clip"] = str(cli_args.libero_clip)
     metrics["T"] = int(gt.shape[1])
     metrics["n_scene_points"] = int(gt.shape[2])
+    metrics["selected_camera_prefixes"] = selected_camera_prefixes
+    metrics["selected_camera_names"] = selected_camera_names
     # NOTE: PointWorld overwrites log variance to a SIM_VAR_CONST for any
     # domain whose name contains "behavior" (see BaseModel.forward), so
     # outputs["confidence"] here is *not* a learned uncertainty. We do not
@@ -382,30 +414,44 @@ def main() -> None:
         # ``shift_amount``.
         pred_np = pred[0].detach().cpu().numpy().astype(np.float32)  # (T, N, 3) centered
         gt_np = gt[0].detach().cpu().numpy().astype(np.float32)  # (T, N, 3) centered
-        # Reconstruct the per-point color lookup from the raw clip.
-        # We want (T, N, 3) uint8 colors that line up with the model's
-        # per-point ordering. After ``sample_cameras`` + the
-        # release pipeline, the model gets a per-point ``scene_colors``
-        # tensor indexed identically to ``scene_flows``; we recover it
-        # by walking back through the raw clip's per-camera arrays in
-        # the same order the sampler used.
-        try:
-            colors_t = _recover_scene_colors(raw)
-        except Exception as e:
-            print(
-                f"WARNING: could not recover scene_colors for "
-                f"out_pred_npz ({e}); saving zeros.",
-                file=sys.stderr,
-            )
-            colors_t = np.zeros(
-                (pred_np.shape[0], pred_np.shape[1], 3), dtype=np.uint8
-            )
+        # Export the exact post-pipeline color tensor that the model saw,
+        # not a raw-clip reconstruction. This keeps the point ordering aligned
+        # with ``pred_scene_flows`` / ``gt_scene_flows`` after ordered camera
+        # selection, grid sampling, and max-point enforcement.
+        colors_t = None
+        if "scene_colors" in sample:
+            scene_colors = sample["scene_colors"]
+            if torch.is_tensor(scene_colors):
+                scene_colors = scene_colors.detach().cpu().numpy()
+            colors_t = np.clip(
+                np.rint(np.asarray(scene_colors, dtype=np.float32) * 255.0),
+                0.0,
+                255.0,
+            ).astype(np.uint8)
+        if colors_t is None:
+            try:
+                colors_t = _recover_scene_colors(raw)
+            except Exception as e:
+                print(
+                    f"WARNING: could not recover scene_colors for "
+                    f"out_pred_npz ({e}); saving zeros.",
+                    file=sys.stderr,
+                )
+                colors_t = np.zeros(
+                    (pred_np.shape[0], pred_np.shape[1], 3), dtype=np.uint8
+                )
         out_path = Path(cli_args.out_pred_npz)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         save_kwargs = dict(
             pred_scene_flows=pred_np,
             gt_scene_flows=gt_np,
             scene_colors=colors_t,
+            selected_camera_prefixes=np.asarray(
+                selected_camera_prefixes, dtype=object
+            ),
+            selected_camera_names=np.asarray(
+                selected_camera_names, dtype=object
+            ),
             # Carry the per-point error so viser can colormap by it
             # without re-doing the math.
             per_point_epe=np.linalg.norm(pred_np - gt_np, axis=-1).astype(
@@ -428,7 +474,7 @@ def main() -> None:
 def _recover_scene_colors(raw: dict) -> np.ndarray:
     """Reconstruct the (T, N, 3) uint8 color tensor that the model sees.
 
-    After :func:`sample_cameras` + the release pipeline, the model's
+    After ordered camera selection + the release pipeline, the model's
     per-point color ordering is: camera_0's points (in the order
     they appear in the clip), then camera_1's points, then camera_2's,
     etc. (the pipeline concatenates every camera's points and then

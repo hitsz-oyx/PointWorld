@@ -160,7 +160,16 @@ def build_app(
     for _ci in range(8):
         if f"camera_{_ci}_scene_flows" in clip:
             cam_ids.append(_ci)
-    print(f"discovered {len(cam_ids)} camera(s) in clip: {cam_ids}")
+    camera_names = [
+        str(x) for x in np.asarray(clip.get("camera_names", []), dtype=object).tolist()
+    ]
+    cam_debug = []
+    for cid in cam_ids:
+        if 0 <= cid < len(camera_names):
+            cam_debug.append(f"{cid}:{camera_names[cid]}")
+        else:
+            cam_debug.append(str(cid))
+    print(f"discovered {len(cam_ids)} camera(s) in clip: {cam_debug}")
     flows_c_list = []
     cols_c_list = []
     valid_c_list = []
@@ -320,7 +329,7 @@ def build_app(
             print(
                 f"predicted overlay: using stamped shift_amount = "
                 f"({shift_amount[0]:+.3f}, {shift_amount[1]:+.3f}, "
-                f"{shift_amount[2]:+.3f}) m (pred stored in world frame)"
+                f"{shift_amount[2]:+.3f}) m (pred stored in centered frame)"
             )
         else:
             valid_t0 = valid[0] if valid.shape[0] > 0 else None
@@ -432,10 +441,7 @@ def build_app(
     # position derived from the dense union's centroid.
     gt_world_handle = None
     gt_trail_handle = None
-    if pred is not None and "gt_scene_flows" in pred and "shift_amount" in pred.files:
-        gt_world = pred["gt_scene_flows"].astype(np.float32) - np.asarray(
-            pred["shift_amount"], dtype=np.float32
-        )
+    if pred is not None and gt_world is not None:
         gt_world_handle = server.scene.add_point_cloud(
             name="/gt_subsampled",
             points=np.zeros((1, 3), dtype=np.float32),
@@ -679,6 +685,7 @@ def build_app(
             # world-frame GT (``gt_world``/``pred_world``) so it is
             # invariant to the choice of centering.
             T_p = pred_world.shape[0]
+            pred_t_idx = min(t, T_p - 1)
             if "per_point_epe" in pred and pred["per_point_epe"].ndim == 2:
                 if pred["per_point_epe"].shape[0] > t:
                     frame_epe = pred["per_point_epe"][t]
@@ -699,7 +706,7 @@ def build_app(
             # lines up with the world-frame cam0/cam1 point cloud.
             # ``pred_world`` was already corrected for the model's
             # ``center_shift`` at the top of ``build_app``.
-            pred_t = pred_world[t]  # (N_p, 3) in world frame
+            pred_t = pred_world[pred_t_idx]  # (N_p, 3) in world frame
             if use_focus:
                 pred_t = pred_t[focus_idx]
                 frame_epe = frame_epe[focus_idx]

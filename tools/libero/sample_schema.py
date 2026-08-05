@@ -43,11 +43,10 @@ CONTEXT_HORIZON = 1
 H_RELEASE = 180
 W_RELEASE = 320
 
-# Two fixed external cameras keep the PointWorld release contract simple:
-# the model still consumes exactly two views, but we avoid the moving
-# eye-in-hand camera that complicates rollout/evaluation semantics.
+# Two fixed oblique views plus birdview provide complementary coverage of
+# tabletop objects. The inference bridge keeps their on-disk order fixed.
 DEFAULT_CAMERAS = ("camera_0", "camera_1")
-DEFAULT_CAMERA_NAMES = ("birdview", "sideview")
+DEFAULT_CAMERA_NAMES = ("frontview", "sideview", "birdview")
 
 
 def _as_float32(x):
@@ -275,6 +274,12 @@ def flatten_for_pointworld(sample: dict) -> dict:
     out["robot_colors"] = sample["robot_colors"]
     out["right_gripper_pose"] = sample["right_gripper_pose"]
     out["right_gripper_open"] = sample["right_gripper_open"]
+    if "camera_names" in sample:
+        out["camera_names"] = np.asarray(sample["camera_names"], dtype=object)
+    if "point_object_names" in sample:
+        out["point_object_names"] = np.asarray(
+            sample["point_object_names"], dtype=object
+        )
     return out
 
 

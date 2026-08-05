@@ -67,6 +67,10 @@ class PredictionVisualizerConfig:
     # Default flow density values (0..1)
     scene_flow_density_default: float = 0.3
     robot_flow_density_default: float = 0.10
+    # Start on the RGB-D upsampled cloud when a camera background is available.
+    # Long-horizon adapters can disable this when their point set changes at
+    # window boundaries.
+    initial_upsample: bool = True
     # Alpha for green tint on unsupervised GT points (0..1) the lower the more subtle the green tint
     unsup_green_alpha: float = 0.3
     # Maximum allowed per-frame step for flow visualization (meters)

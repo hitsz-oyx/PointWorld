@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+import types
 
 import numpy as np
 import pytest
@@ -25,6 +26,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# ``dataset_components.cameras`` only needs ``_stable_int_hash`` at import
+# time; the real implementation lives behind a numba dependency that is not
+# available in this test environment.
+if "dataset_components.utils" not in sys.modules:
+    utils_stub = types.ModuleType("dataset_components.utils")
+    utils_stub._stable_int_hash = lambda *parts: 0
+    sys.modules["dataset_components.utils"] = utils_stub
+
+from dataset_components.cameras import select_cameras_in_order
 from tools.libero import sample_schema
 from tools.libero.scene_geometry import (
     backproject_depth,
@@ -298,3 +308,26 @@ def test_extrinsic_is_world_to_camera(synth_clip):
     # In the fixture T_w_c == I, so the schema extrinsic T_c_w == I too.
     assert np.allclose(E, T_w_c_expected, atol=1e-6), \
         "Stored extrinsic does not match the world-to-camera convention."
+
+
+def test_select_cameras_in_order_preserves_export_order() -> None:
+    sample, _ = dummy_clip()
+    sample["camera_names"] = np.asarray(["birdview", "sideview"], dtype=object)
+
+    # Make the two cameras trivially distinguishable.
+    sample["scene_flows_per_cam"]["camera_0"].fill(0.0)
+    sample["scene_flows_per_cam"]["camera_1"].fill(1.0)
+
+    flat = sample_schema.flatten_for_pointworld(sample)
+    ordered = select_cameras_in_order(flat, num_cameras=2)
+
+    n0 = sample["scene_flows_per_cam"]["camera_0"].shape[1]
+    assert np.allclose(ordered["scene_flows"][:, :n0], 0.0)
+    assert np.allclose(ordered["scene_flows"][:, n0:], 1.0)
+    assert list(ordered["camera_names"]) == ["birdview", "sideview"]
+    assert list(ordered["__selected_camera_prefixes__"]) == [
+        "camera_0",
+        "camera_1",
+    ]
+    assert "cam0_initial_rgb" in ordered
+    assert "cam1_initial_rgb" in ordered

@@ -545,24 +545,26 @@ def test_mesh_surface_sampling_correctness() -> None:
 # Test 8: BDDL parsing from env_args attribute (P1-1).
 # ----------------------------------------------------------------------------
 
-def test_parse_bddl_from_env_args() -> None:
-    """``_parse_bddl_from_env_args`` must handle JSON strings, dicts,
-    bytes, and the missing-key case.
-
-    The official LIBERO dataset writes the BDDL hint inside an
-    ``env_args`` JSON blob at the ``/data`` level. Different writer
-    versions store the same blob as a JSON string, a Python dict,
-    or (rarely) bytes; the resolver must accept all three.
-    """
-    # ``_parse_bddl_from_env_args`` lives in export_clip, which imports
-    # LIBERO at module load. Inject a tiny stub for the bits we touch
-    # so the test runs in pointworld-env (no LIBERO installed).
+def _import_export_clip_with_stubs():
     import sys
     import types
-    # The export_clip module does ``from libero.libero.envs import
-    # OffScreenRenderEnv`` etc. We only need the symbols it references
-    # *at import time* for this test (just the function), so stub the
-    # rest away.
+
+    if "h5py" not in sys.modules:
+        h5py_stub = types.ModuleType("h5py")
+        h5py_stub.File = object
+        sys.modules["h5py"] = h5py_stub
+
+    for mod_name in (
+        "robosuite", "robosuite.macros", "robosuite.utils",
+        "robosuite.utils.macros",
+    ):
+        if mod_name not in sys.modules:
+            sys.modules[mod_name] = types.ModuleType(mod_name)
+    sys.modules["robosuite.macros"].IMAGE_CONVENTION = "opencv"
+    sys.modules["robosuite.utils.macros"].IMAGE_CONVENTION = "opencv"
+    sys.modules["robosuite"].macros = sys.modules["robosuite.macros"]
+    sys.modules["robosuite.utils"].macros = sys.modules["robosuite.utils.macros"]
+
     for mod_name in (
         "libero", "libero.libero", "libero.libero.envs", "libero.libero.utils",
     ):
@@ -577,17 +579,29 @@ def test_parse_bddl_from_env_args() -> None:
     xml_post_stub = types.ModuleType("libero.libero.envs.utils")
     xml_post_stub.postprocess_model_xml = lambda x, y: x
     sys.modules["libero.libero.envs.utils"] = xml_post_stub
-    # Stub get_libero_path (used by _rewrite_libero_asset_paths if it
-    # ever runs during the test). We don't call it, so a no-op is fine.
     lib_pkg = types.ModuleType("libero.libero")
     lib_pkg.get_libero_path = lambda key: "/tmp/libero_does_not_exist"
     sys.modules["libero.libero"] = lib_pkg
     sys.modules["libero"].libero = lib_pkg
 
-    # The import below also triggers ``from .sample_schema import ...``,
-    # which has no third-party deps (just numpy). That part should work
-    # in pointworld-env.
     from tools.libero import export_clip  # type: ignore
+
+    return export_clip
+
+
+def test_parse_bddl_from_env_args() -> None:
+    """``_parse_bddl_from_env_args`` must handle JSON strings, dicts,
+    bytes, and the missing-key case.
+
+    The official LIBERO dataset writes the BDDL hint inside an
+    ``env_args`` JSON blob at the ``/data`` level. Different writer
+    versions store the same blob as a JSON string, a Python dict,
+    or (rarely) bytes; the resolver must accept all three.
+    """
+    # ``_parse_bddl_from_env_args`` lives in export_clip, which imports
+    # LIBERO at module load. Inject a tiny stub for the bits we touch
+    # so the test runs in pointworld-env (no LIBERO installed).
+    export_clip = _import_export_clip_with_stubs()
 
     # JSON-string form.
     raw_json = '{"bddl_file_name": "/tmp/foo.bddl", "robots": ["Panda"]}'
@@ -610,6 +624,45 @@ def test_parse_bddl_from_env_args() -> None:
     assert export_clip._parse_bddl_from_env_args("") is None
     # Wrong type.
     assert export_clip._parse_bddl_from_env_args(42) is None
+
+
+def test_env_kwargs_from_env_args_supports_official_and_legacy_formats() -> None:
+    export_clip = _import_export_clip_with_stubs()
+
+    official = {
+        "problem_name": "libero_tabletop_manipulation",
+        "env_kwargs": {
+            "robots": ["Panda"],
+            "camera_names": ["agentview", "robot0_eye_in_hand"],
+            "control_freq": 20,
+            "controller_configs": {"type": "OSC_POSE", "kp": 150},
+        },
+    }
+    kwargs_official = export_clip._env_kwargs_from_env_args(official)
+    assert kwargs_official["robots"] == ["Panda"]
+    assert kwargs_official["camera_names"] == ["agentview", "robot0_eye_in_hand"]
+    assert kwargs_official["control_freq"] == 20
+    assert kwargs_official["controller_configs"] == {"type": "OSC_POSE", "kp": 150}
+
+    legacy = {
+        "bddl_file_name": "/tmp/demo_task.bddl",
+        "robots": ["Panda"],
+        "control_freq": 10,
+    }
+    kwargs_legacy = export_clip._env_kwargs_from_env_args(legacy)
+    assert kwargs_legacy["bddl_file_name"] == "/tmp/demo_task.bddl"
+    assert kwargs_legacy["robots"] == ["Panda"]
+    assert kwargs_legacy["control_freq"] == 10
+
+    wrapped = {
+        "type": 1,
+        "env_name": "dummy",
+        "problem_name": "dummy_task",
+        "bddl_file": "/tmp/from_wrapper.bddl",
+    }
+    kwargs_wrapped = export_clip._env_kwargs_from_env_args(wrapped)
+    assert kwargs_wrapped["bddl_file_name"] == "/tmp/from_wrapper.bddl"
+    assert "problem_name" not in kwargs_wrapped
 
 
 # ----------------------------------------------------------------------------
@@ -637,6 +690,8 @@ def main() -> int:
          test_mesh_surface_sampling_correctness),
         ("parse_bddl_from_env_args",
          test_parse_bddl_from_env_args),
+        ("env_kwargs_from_env_args_supports_official_and_legacy_formats",
+         test_env_kwargs_from_env_args_supports_official_and_legacy_formats),
     ]:
         try:
             fn()

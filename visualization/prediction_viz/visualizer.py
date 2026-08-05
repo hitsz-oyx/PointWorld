@@ -358,10 +358,21 @@ class PredictionVisualizer:
             apply_magenta_blend(robot_flow, float(self._config.robot_magenta_blend))
 
         robot_tracks = None
+        robot_transition_mask = sample.robot_flow_transitions
         if sample.robot_flows is not None and np.asarray(sample.robot_flows).size:
             robot_tracks = _ensure_float_array(sample.robot_flows)
             if robot_tracks.ndim != 3 or robot_tracks.shape[-1] != 3:
                 raise ValueError("robot_flows must have shape (T, N, 3)")
+            if robot_transition_mask is not None:
+                robot_transition_mask = np.asarray(
+                    robot_transition_mask, dtype=bool
+                )
+                expected_shape = (max(robot_tracks.shape[0] - 1, 0), robot_tracks.shape[1])
+                if robot_transition_mask.shape != expected_shape:
+                    raise ValueError(
+                        "robot_flow_transitions shape mismatch; expected "
+                        f"{expected_shape}, got {robot_transition_mask.shape}"
+                    )
             robot_flow.trajectories = robot_tracks.astype(np.float32, copy=False)
         else:
             robot_tracks = robot_flow.trajectories
@@ -375,6 +386,8 @@ class PredictionVisualizer:
                 robot_tracks = robot_tracks[:, robot_all_mask, :]
                 robot_flow.trajectories = robot_tracks
                 robot_exists_current = sample.robot_exists[:, robot_all_mask]
+                if robot_transition_mask is not None:
+                    robot_transition_mask = robot_transition_mask[:, robot_all_mask]
             else:
                 robot_exists_current = sample.robot_exists
         else:
@@ -462,6 +475,15 @@ class PredictionVisualizer:
         # Positions and masks
         exists_mask = sample.scene_exists.astype(bool)
         supervised_mask = sample.scene_supervised_mask.astype(bool)
+        scene_transition_mask = sample.scene_flow_transitions
+        if scene_transition_mask is not None:
+            scene_transition_mask = np.asarray(scene_transition_mask, dtype=bool)
+            expected_shape = (max(Tn - 1, 0), Nn)
+            if scene_transition_mask.shape != expected_shape:
+                raise ValueError(
+                    "scene_flow_transitions shape mismatch; expected "
+                    f"{expected_shape}, got {scene_transition_mask.shape}"
+                )
         pred_positions = sample.scene_prediction.astype(np.float32) if sample.scene_prediction is not None else None
         if pred_positions is not None and pred_positions.shape[:2] != (Tn, Nn):
             raise ValueError("scene_prediction shape mismatch with ground truth")
@@ -491,6 +513,11 @@ class PredictionVisualizer:
                         exists_mask[:, gt_fully_supervised_tmp],
                         colormap=lambda u: __import__("matplotlib").cm.get_cmap(self._config.flow_colormap)(u),
                         min_brightness=float(self._config.min_flow_brightness),
+                        transition_mask=(
+                            None
+                            if scene_transition_mask is None
+                            else scene_transition_mask[:, gt_fully_supervised_tmp]
+                        ),
                     )
                 else:
                     flow_pred_tl = FlowTimeline.empty(Tn)
@@ -500,6 +527,7 @@ class PredictionVisualizer:
                     exists_mask,
                     colormap=lambda u: __import__("matplotlib").cm.get_cmap(self._config.flow_colormap)(u),
                     min_brightness=float(self._config.min_flow_brightness),
+                    transition_mask=scene_transition_mask,
                 )
         else:
             flow_pred_tl = FlowTimeline.empty(Tn)
@@ -511,6 +539,11 @@ class PredictionVisualizer:
                 exists_mask[:, gt_fully_supervised],
                 colormap=lambda u: __import__("matplotlib").cm.get_cmap(self._config.flow_colormap)(u),
                 min_brightness=float(self._config.min_flow_brightness),
+                transition_mask=(
+                    None
+                    if scene_transition_mask is None
+                    else scene_transition_mask[:, gt_fully_supervised]
+                ),
             )
         else:
             flow_gt_tl = FlowTimeline.empty(Tn)
@@ -526,6 +559,7 @@ class PredictionVisualizer:
                 active_mask=None,
                 color_rgb=self._config.robot_color_rgb,
                 min_brightness=float(self._config.min_robot_transparency),
+                transition_mask=robot_transition_mask,
             )
             Nr = tracks_for_lines.shape[1]
             mag = np.tile(np.array([[255, 0, 255]], dtype=np.uint8), (Nr, 1))
@@ -681,6 +715,8 @@ class PredictionVisualizer:
                         default_gt_checked=(pred_positions is None),
                         exists_mask=exists_mask,
                         pred_positions_orig=pred_positions,
+                        scene_transition_mask=scene_transition_mask,
+                        robot_transition_mask=robot_transition_mask,
                         scene_point_size=scene_point_size,
                         robot_point_size=robot_point_size,
                     )
@@ -723,6 +759,8 @@ class PredictionVisualizer:
         default_gt_checked: bool,
         exists_mask: np.ndarray,
         pred_positions_orig: Optional[np.ndarray],
+        scene_transition_mask: Optional[np.ndarray],
+        robot_transition_mask: Optional[np.ndarray],
         scene_point_size: float = 0.004,
         robot_point_size: float = 0.004,
     ) -> List[object]:
@@ -794,7 +832,7 @@ class PredictionVisualizer:
         state = {
             "frame": 0,
             "use_gt": bool(default_gt_checked),
-            "upsample": True,
+            "upsample": bool(self._config.initial_upsample),
             "workspace_bounds": False,
             "full_overlay_opacity": 0.5,
             "scene_flow_density": float(self._config.scene_flow_density_default),
@@ -826,8 +864,8 @@ class PredictionVisualizer:
             point_shape="rounded",
             precision="float32",
         )
-        up_pc.visible = True
-        dyn_pc.visible = False
+        up_pc.visible = bool(state["upsample"])
+        dyn_pc.visible = not bool(state["upsample"])
 
         # Flow handles (pred and GT; visibility controlled by toggle + density)
         fp_pts, fp_cols = flow_pred_tl.slice_for_frame(0)
@@ -1040,7 +1078,9 @@ class PredictionVisualizer:
         with control_folder:
             slider = server.gui.add_slider("Frame", min=0, max=max(T - 1, 0), step=1, initial_value=0)
             gt_toggle = server.gui.add_checkbox(label="Ground-truth", initial_value=bool(default_gt_checked))
-            up_toggle = server.gui.add_checkbox(label="Upsample", initial_value=True)
+            up_toggle = server.gui.add_checkbox(
+                label="Upsample", initial_value=bool(state["upsample"])
+            )
             full_opacity_slider = server.gui.add_slider(
                 "Full overlay opacity",
                 min=0.0,
@@ -1134,6 +1174,11 @@ class PredictionVisualizer:
                     exists_sel,
                     colormap=lambda u: __import__("matplotlib").cm.get_cmap(self._config.flow_colormap)(u),
                     min_brightness=float(self._config.min_flow_brightness),
+                    transition_mask=(
+                        None
+                        if scene_transition_mask is None
+                        else scene_transition_mask[:, sel]
+                    ),
                 )
 
             exists0 = exists_mask[0]
@@ -1188,6 +1233,11 @@ class PredictionVisualizer:
                 active_mask=None,
                 color_rgb=self._config.robot_color_rgb,
                 min_brightness=float(self._config.min_robot_transparency),
+                transition_mask=(
+                    None
+                    if robot_transition_mask is None
+                    else robot_transition_mask[:, sel]
+                ),
             )
 
         # Apply initial density defaults

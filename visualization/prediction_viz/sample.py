@@ -40,6 +40,9 @@ class PredictionVisualizerSample:
     # Robot state (generic)
     robot_flows: Optional[np.ndarray]
     robot_exists: np.ndarray
+    # Optional (T-1, N) masks that prevent flow lines across discontinuities.
+    scene_flow_transitions: Optional[np.ndarray] = None
+    robot_flow_transitions: Optional[np.ndarray] = None
     # For overlays (optional, embodiment-dependent)
     joint_positions: Optional[np.ndarray] = None          # Panda: (T, 7)
     gripper_positions: Optional[np.ndarray] = None        # Panda: (T,)
@@ -231,6 +234,20 @@ def build_sample_from_dictionary(
     robot_exists = _normalize_mask_time(sample_dict["robot_exists"], T, robot_N, "robot_exists") if robot_N > 0 else np.zeros((T, 0), dtype=bool)
     scene_supervised_mask = _normalize_mask_time(sample_dict["scene_supervised_mask"], T, N, "scene_supervised_mask")
 
+    def _transition_mask(key: str, expected_N: int) -> Optional[np.ndarray]:
+        if key not in sample_dict:
+            return None
+        mask = np.asarray(sample_dict[key], dtype=bool)
+        expected_shape = (max(T - 1, 0), expected_N)
+        if mask.shape != expected_shape:
+            raise ValueError(
+                f"{key} expected shape {expected_shape}, got {mask.shape}"
+            )
+        return mask
+
+    scene_flow_transitions = _transition_mask("scene_flow_transition_mask", N)
+    robot_flow_transitions = _transition_mask("robot_flow_transition_mask", robot_N)
+
     shift_amount = None
     if "__shift_amount__" in sample_dict:
         shift_raw = _ensure_float_array(sample_dict["__shift_amount__"]).reshape(-1)
@@ -274,6 +291,8 @@ def build_sample_from_dictionary(
         scene_supervised_mask=scene_supervised_mask,
         robot_flows=robot_flows,
         robot_exists=robot_exists,
+        scene_flow_transitions=scene_flow_transitions,
+        robot_flow_transitions=robot_flow_transitions,
         joint_positions=(kin.panda_joint_positions if kin.panda_joint_positions is not None else None),
         gripper_positions=(kin.panda_gripper_positions if kin.panda_gripper_positions is not None else None),
         joint_names=joint_names,

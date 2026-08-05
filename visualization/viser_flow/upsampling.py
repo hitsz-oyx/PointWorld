@@ -33,6 +33,79 @@ class VoxelAssignment:
     initial_points: np.ndarray
     flow_to_points: List[np.ndarray]
     static_indices: np.ndarray
+    background_flow_indices: np.ndarray
+
+    def build_frame(
+        self,
+        flow_positions: np.ndarray,
+        flow_exists: np.ndarray,
+        *,
+        supervised: Optional[np.ndarray] = None,
+        tint_alpha: float = 0.5,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Build one dense frame without materializing the whole timeline.
+
+        This is the interactive path used while a slider moves. The cached
+        background-to-flow lookup keeps the update vectorized rather than
+        iterating through every sparse flow point in Python.
+        """
+        positions = np.asarray(flow_positions, dtype=np.float32)
+        exists = np.asarray(flow_exists, dtype=bool)
+        if positions.shape != self.initial_points.shape:
+            raise ValueError(
+                "flow_positions must have shape "
+                f"{self.initial_points.shape}, got {positions.shape}"
+            )
+        if exists.shape != self.initial_points.shape[:1]:
+            raise ValueError(
+                "flow_exists must have shape "
+                f"{self.initial_points.shape[:1]}, got {exists.shape}"
+            )
+        if self.background_flow_indices.shape != self.background_points.shape[:1]:
+            raise ValueError("background_flow_indices shape mismatch")
+
+        supervised_mask = None
+        if supervised is not None:
+            supervised_mask = np.asarray(supervised, dtype=bool)
+            if supervised_mask.shape != exists.shape:
+                raise ValueError("supervised mask must match flow_exists shape")
+
+        flow_indices = self.background_flow_indices
+        assigned = flow_indices >= 0
+        active = assigned.copy()
+        active[assigned] = exists[flow_indices[assigned]]
+        dynamic_indices = np.flatnonzero(active)
+
+        static_points = self.background_points[self.static_indices]
+        static_colors = self.background_colors[self.static_indices]
+        if dynamic_indices.size == 0:
+            return (
+                static_points.astype(np.float32, copy=False),
+                static_colors.astype(np.uint8, copy=False),
+            )
+
+        dynamic_flows = flow_indices[dynamic_indices]
+        deltas = positions[dynamic_flows] - self.initial_points[dynamic_flows]
+        dynamic_points = self.background_points[dynamic_indices] + deltas
+        dynamic_colors = self.background_colors[dynamic_indices].astype(
+            np.float32, copy=True
+        )
+        if supervised_mask is not None:
+            unsupervised = ~supervised_mask[dynamic_flows]
+            if np.any(unsupervised):
+                dynamic_colors[unsupervised] = (
+                    (1.0 - float(tint_alpha)) * dynamic_colors[unsupervised]
+                    + float(tint_alpha) * _GREEN
+                )
+        return (
+            np.concatenate([static_points, dynamic_points], axis=0).astype(
+                np.float32, copy=False
+            ),
+            np.concatenate(
+                [static_colors, dynamic_colors.clip(0.0, 255.0).astype(np.uint8)],
+                axis=0,
+            ).astype(np.uint8, copy=False),
+        )
 
     def build_timeline(
         self,
@@ -56,38 +129,19 @@ class VoxelAssignment:
         else:
             supervised_mask = None
 
-        T, N = positions.shape[:2]
-        static_points = self.background_points[self.static_indices]
-        static_colors = self.background_colors[self.static_indices]
+        T = positions.shape[0]
         frames: List[np.ndarray] = []
         frame_colors: List[np.ndarray] = []
 
         for t in range(T):
-            pts_segments: List[np.ndarray] = []
-            col_segments: List[np.ndarray] = []
-            if static_points.size:
-                pts_segments.append(static_points.astype(np.float32, copy=False))
-                col_segments.append(static_colors.astype(np.uint8, copy=False))
-            for n in range(N):
-                point_indices = self.flow_to_points[n]
-                if point_indices.size == 0:
-                    continue
-                if not exists[t, n]:
-                    continue
-                delta = positions[t, n] - self.initial_points[n]
-                updated = self.background_points[point_indices] + delta
-                cols = self.background_colors[point_indices].astype(np.float32, copy=True)
-                if supervised_mask is not None and not supervised_mask[t, n]:
-                    cols = (1.0 - float(tint_alpha)) * cols + float(tint_alpha) * _GREEN
-                pts_segments.append(updated.astype(np.float32, copy=False))
-                col_segments.append(cols.clip(0.0, 255.0).astype(np.uint8))
-
-            if pts_segments:
-                frames.append(np.concatenate(pts_segments, axis=0).astype(np.float32, copy=False))
-                frame_colors.append(np.concatenate(col_segments, axis=0).astype(np.uint8, copy=False))
-            else:
-                frames.append(np.empty((0, 3), dtype=np.float32))
-                frame_colors.append(np.empty((0, 3), dtype=np.uint8))
+            frame_points, frame_colors_t = self.build_frame(
+                positions[t],
+                exists[t],
+                supervised=(None if supervised_mask is None else supervised_mask[t]),
+                tint_alpha=tint_alpha,
+            )
+            frames.append(frame_points)
+            frame_colors.append(frame_colors_t)
 
         return PointTimeline(frames, frame_colors)
 
@@ -124,6 +178,7 @@ def build_voxel_assignment(
         voxel_map.setdefault(key, []).append(idx)
 
     assigned = np.zeros((bg_pts.shape[0],), dtype=bool)
+    background_flow_indices = np.full((bg_pts.shape[0],), -1, dtype=np.int64)
     flow_to_points: List[List[int]] = [[] for _ in range(initial_positions.shape[0])]
 
     for i, point in enumerate(bg_pts):
@@ -138,6 +193,7 @@ def build_voxel_assignment(
             distances = np.linalg.norm(initial_positions_subset - point, axis=1)
             chosen = candidates[int(np.argmin(distances))]
         assigned[i] = True
+        background_flow_indices[i] = chosen
         flow_to_points[chosen].append(i)
 
     flow_point_arrays: List[np.ndarray] = []
@@ -155,4 +211,5 @@ def build_voxel_assignment(
         initial_points=initial_positions.astype(np.float32, copy=False),
         flow_to_points=flow_point_arrays,
         static_indices=static_indices.astype(np.int64, copy=False),
+        background_flow_indices=background_flow_indices,
     )

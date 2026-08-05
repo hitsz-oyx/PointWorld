@@ -102,10 +102,13 @@ rt_openloop_*.pkl
 **_part_transform.json
 deploy_logs/
 exp_obs/
+artifacts/
 assets/b1_description
 assets/franka_allegro
 assets/franka_description/stack-robotiq-tri.urdf
+assets/franka_description/meshes/
 assets/g1_description/
+assets/r1pro/
 paper-eval/plots/
 viser-client/
 visualization/episode_*_teaser/

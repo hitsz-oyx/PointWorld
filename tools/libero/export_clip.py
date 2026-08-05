@@ -157,6 +157,15 @@ from .sample_schema import (
     empty_clip,
     save_npz,
 )
+from .camera_layout import (
+    CAMERA_LAYOUT_NATIVE,
+    CAMERA_LAYOUT_OBLIQUE_PAIR,
+    CAMERA_LAYOUT_OBLIQUE_TRIPLET,
+    OBLIQUE_CAMERA_NAMES,
+    OBLIQUE_TRIPLET_CAMERA_NAMES,
+    oblique_pair_poses,
+    oblique_triplet_poses,
+)
 from .scene_geometry import (
     backproject_depth,
     estimate_normals_from_depth,
@@ -315,6 +324,188 @@ def _parse_bddl_from_env_args(raw: object) -> str | None:
     return cand if isinstance(cand, str) and cand else None
 
 
+def _parse_env_args_blob(raw: object) -> dict:
+    """Normalize an ``env_args`` HDF5 attribute into a plain dict."""
+    if raw is None:
+        return {}
+    if isinstance(raw, (str, bytes)):
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+    elif isinstance(raw, dict):
+        parsed = dict(raw)
+    else:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return parsed
+
+
+def _env_kwargs_from_env_args(raw: object) -> dict:
+    """Extract constructor kwargs from official or legacy LIBERO ``env_args``.
+
+    Official dataset exports store a metadata wrapper like:
+
+    ``{"problem_name": ..., "env_kwargs": {...}}``
+
+    while local smoke-test recordings store a flat subset directly on
+    ``env_args``. We accept both and strip wrapper-only metadata keys.
+    """
+    env_args = _parse_env_args_blob(raw)
+    if not env_args:
+        return {}
+
+    nested = env_args.get("env_kwargs")
+    if isinstance(nested, dict):
+        kwargs = dict(nested)
+    else:
+        kwargs = {
+            k: v
+            for k, v in env_args.items()
+            if k not in {"type", "env_name", "problem_name", "env_kwargs"}
+        }
+
+    bddl_file = env_args.get("bddl_file")
+    if (
+        isinstance(bddl_file, str)
+        and bddl_file
+        and "bddl_file_name" not in kwargs
+    ):
+        kwargs["bddl_file_name"] = bddl_file
+
+    return kwargs
+
+
+def _load_env_args_for_demo(f: "h5py.File", demo_group) -> tuple[dict, str | None]:
+    """Return the best-effort ``env_args`` dict and its source label."""
+    data_group = f.get("data") if hasattr(f, "get") else None
+    if data_group is not None and "env_args" in data_group.attrs:
+        env_args = _parse_env_args_blob(data_group.attrs["env_args"])
+        if env_args:
+            return env_args, "/data.attrs['env_args']"
+    if "env_args" in demo_group.attrs:
+        env_args = _parse_env_args_blob(demo_group.attrs["env_args"])
+        if env_args:
+            return env_args, "demo_group.attrs['env_args']"
+    return {}, None
+
+
+class _DirectLiberoEnvAdapter:
+    """Minimal adapter that exposes the subset of ``ControlEnv`` used here."""
+
+    def __init__(self, env):
+        self.env = env
+
+    @property
+    def obj_of_interest(self):
+        return self.env.obj_of_interest
+
+    def step(self, action):
+        return self.env.step(action)
+
+    def reset(self):
+        # Match OffScreenRenderEnv's retry semantics on randomization failures.
+        try:
+            from robosuite.utils.errors import RandomizationError  # type: ignore
+        except Exception:  # pragma: no cover - only in constrained test stubs
+            RandomizationError = Exception
+        success = False
+        ret = None
+        while not success:
+            try:
+                ret = self.env.reset()
+                success = True
+            except RandomizationError:
+                pass
+        return ret
+
+    def check_success(self):
+        return self.env._check_success()
+
+    @property
+    def _visualizations(self):
+        return self.env._visualizations
+
+    @property
+    def robots(self):
+        return self.env.robots
+
+    @property
+    def sim(self):
+        return self.env.sim
+
+    def get_sim_state(self):
+        return self.env.sim.get_state().flatten()
+
+    def _post_process(self):
+        return self.env._post_process()
+
+    def _update_observables(self, force=False):
+        self.env._update_observables(force=force)
+
+    def set_state(self, mujoco_state):
+        self.env.sim.set_state_from_flattened(mujoco_state)
+
+    def reset_from_xml_string(self, xml_string):
+        self.env.reset_from_xml_string(xml_string)
+
+    def seed(self, seed):
+        self.env.seed(seed)
+
+    def set_init_state(self, init_state):
+        return self.regenerate_obs_from_state(init_state)
+
+    def regenerate_obs_from_state(self, mujoco_state):
+        self.set_state(mujoco_state)
+        self.env.sim.forward()
+        self.check_success()
+        self._post_process()
+        self._update_observables(force=True)
+        return self.env._get_observations()
+
+    def close(self):
+        self.env.close()
+        del self.env
+
+
+def _apply_camera_layout(
+    env,
+    *,
+    camera_names: Sequence[str],
+    camera_layout: str,
+) -> None:
+    """Apply a fixed external camera layout after LIBERO loads the demo XML."""
+    if camera_layout == CAMERA_LAYOUT_NATIVE:
+        return
+    if camera_layout == CAMERA_LAYOUT_OBLIQUE_PAIR:
+        expected_names = OBLIQUE_CAMERA_NAMES
+        positions, quaternions = oblique_pair_poses()
+    elif camera_layout == CAMERA_LAYOUT_OBLIQUE_TRIPLET:
+        expected_names = OBLIQUE_TRIPLET_CAMERA_NAMES
+        positions, quaternions = oblique_triplet_poses()
+    else:
+        raise ValueError(f"Unsupported camera layout: {camera_layout!r}")
+    if tuple(camera_names) != expected_names:
+        raise ValueError(
+            f"{camera_layout!r} requires camera_names {expected_names}, "
+            f"got {tuple(camera_names)}"
+        )
+    for camera_name, position, quaternion in zip(
+        camera_names, positions, quaternions
+    ):
+        camera_id = env.sim.model.camera_name2id(camera_name)
+        env.sim.model.cam_pos[camera_id] = position
+        env.sim.model.cam_quat[camera_id] = quaternion
+    env.sim.forward()
+    print(
+        f"[export_clip] applied {camera_layout} camera layout: "
+        f"names={list(camera_names)}, positions={positions.tolist()}"
+    )
+
+
 def make_libero_env_from_demo(
     demo_hdf5: str,
     demo_id: str,
@@ -323,6 +514,7 @@ def make_libero_env_from_demo(
     width: int,
     bddl: str | None = None,
     bddl_search_dirs: list[str] | None = None,
+    camera_layout: str = CAMERA_LAYOUT_NATIVE,
 ):
     """Build a LIBERO env by reading ``model_file`` / ``env_args`` out of the
     demo HDF5 and replaying the canonical LIBERO reset_from_xml_string path.
@@ -335,53 +527,22 @@ def make_libero_env_from_demo(
         raise ValueError(f"demo_id '{demo_id}' not found in {demo_hdf5}")
     demo_group = f[f"data/{demo_id}"]
 
-    if "model_file" not in demo_group.attrs:
-        # Fall back to a "model_file" dataset if the XML is too large to
-        # fit as an attribute (HDF5 caps attributes at 64 KB). The recorded
-        # demo produced by ``tools.libero.record_one_demo`` uses this
-        # fallback for any non-trivial LIBERO scene.
-        if "model_file" in demo_group:
-            model_file = demo_group["model_file"][()]
-            if isinstance(model_file, bytes):
-                model_file = model_file.decode("utf-8")
-        else:
-            f.close()
-            raise ValueError(
-                f"Demo group {demo_id} is missing the 'model_file' "
-                "attribute and 'model_file' dataset. This exporter "
-                "requires a HDF5 file produced by a recent LIBERO."
-            )
-    else:
+    if "model_file" in demo_group.attrs:
         model_file = demo_group.attrs["model_file"]
-        if isinstance(model_file, bytes):
-            model_file = model_file.decode("utf-8")
+    elif "model_file" in demo_group:
+        model_file = demo_group["model_file"][()]
+    else:
+        f.close()
+        raise ValueError(
+            f"Demo group {demo_id} is missing both 'model_file' attribute "
+            "and dataset."
+        )
+    if isinstance(model_file, bytes):
+        model_file = model_file.decode("utf-8")
     model_xml = libero_env_utils.postprocess_model_xml(model_file, {})
-    # The recorded XML also references ``chiliocosm/assets/...`` paths
-    # for the LIBERO-specific meshes; rewrite them to the local assets dir.
     model_xml = _rewrite_libero_asset_paths(model_xml)
 
-    raw_env_args = demo_group.attrs.get("env_args", None)
-    # ``env_args`` may be a JSON string (as written by
-    # ``tools.libero.record_one_demo``) rather than a real dict, depending
-    # on which tool produced the HDF5. Normalize to a dict.
-    if raw_env_args is None:
-        env_args = {}
-    elif isinstance(raw_env_args, (str, bytes)):
-        if isinstance(raw_env_args, bytes):
-            raw_env_args = raw_env_args.decode("utf-8")
-        try:
-            env_args = json.loads(raw_env_args)
-        except json.JSONDecodeError:
-            env_args = {}
-    elif isinstance(raw_env_args, dict):
-        env_args = dict(raw_env_args)
-    else:
-        env_args = {}
-
-    # Resolve the BDDL: prefer the explicit --bddl flag, then the
-    # /data attrs (official LIBERO recordings), then the in-HDF5
-    # env_args (legacy recording format), then the BDDL with the same
-    # stem as the HDF5 (real LIBERO dataset layout on a clean checkout).
+    env_args, env_args_source = _load_env_args_for_demo(f, demo_group)
     bddl_file = _resolve_bddl_for_demo(
         demo_hdf5=demo_hdf5,
         f=f,
@@ -389,31 +550,77 @@ def make_libero_env_from_demo(
         cli_bddl=bddl,
         extra_search_dirs=bddl_search_dirs,
     )
-    if bddl_file is None:
-        f.close()
-        raise ValueError(
-            f"Demo group {demo_id} is missing 'env_args/bddl_file_name' "
-            "and no --bddl flag was provided. Pass --bddl explicitly."
+
+    import robosuite.macros as _rs_macros_dbg  # type: ignore
+
+    print(
+        "[export_clip] robosuite.macros.IMAGE_CONVENTION at env create = "
+        f"{_rs_macros_dbg.IMAGE_CONVENTION}"
+    )
+    env_kwargs = _env_kwargs_from_env_args(env_args)
+    env_kwargs.update(
+        {
+            "bddl_file_name": bddl_file,
+            "camera_names": list(camera_names),
+            "camera_widths": width,
+            "camera_heights": height,
+            "camera_depths": True,
+            "camera_segmentations": "element",
+            "has_renderer": False,
+            "has_offscreen_renderer": True,
+            "use_camera_obs": True,
+            "ignore_done": True,
+        }
+    )
+    if env_args_source is not None:
+        print(
+            f"[export_clip] using env kwargs from {env_args_source}; "
+            f"keys={sorted(env_kwargs.keys())}",
+            file=sys.stderr,
         )
 
-    # Verify the convention value at the moment we hand the env to
-    # ``OffScreenRenderEnv``. The camera observable closure reads from
-    # ``robosuite.macros`` (not ``robosuite.utils.macros``), so check
-    # the one that actually controls rendering.
-    import robosuite.macros as _rs_macros_dbg  # type: ignore
-    print(f"[export_clip] robosuite.macros.IMAGE_CONVENTION at env create = {_rs_macros_dbg.IMAGE_CONVENTION}")
-    env = OffScreenRenderEnv(
-        bddl_file_name=bddl_file,
-        camera_names=list(camera_names),
-        camera_widths=width,
-        camera_heights=height,
-        camera_depths=True,
-        camera_segmentations="element",  # per-geom; see `get_per_pixel_bodies`.
-    )
-    env.reset()
-    # Canonical LIBERO replay pattern (see docs/指导.md §5 P0#5):
-    env.reset_from_xml_string(model_xml)
-    env.sim.reset()
+    problem_name = env_args.get("problem_name")
+    if not isinstance(problem_name, str) or not problem_name:
+        try:
+            import libero.libero.envs.bddl_utils as libero_bddl_utils  # type: ignore
+
+            problem_name = libero_bddl_utils.get_problem_info(bddl_file).get(
+                "problem_name"
+            )
+        except Exception:
+            problem_name = None
+    if isinstance(problem_name, str) and problem_name:
+        from libero.libero.envs import TASK_MAPPING  # type: ignore
+
+        if problem_name not in TASK_MAPPING:
+            f.close()
+            raise KeyError(
+                f"Problem {problem_name!r} not found in LIBERO TASK_MAPPING"
+            )
+        env = _DirectLiberoEnvAdapter(TASK_MAPPING[problem_name](**env_kwargs))
+    else:
+        wrapper_kwargs = dict(env_kwargs)
+        controller_cfg = wrapper_kwargs.pop("controller_configs", None)
+        if isinstance(controller_cfg, dict) and "controller" not in wrapper_kwargs:
+            controller_type = controller_cfg.get("type")
+            if isinstance(controller_type, str) and controller_type:
+                wrapper_kwargs["controller"] = controller_type
+        env = OffScreenRenderEnv(**wrapper_kwargs)
+
+    try:
+        env.reset()
+        env.reset_from_xml_string(model_xml)
+        env.sim.reset()
+        _apply_camera_layout(
+            env,
+            camera_names=camera_names,
+            camera_layout=camera_layout,
+        )
+    except Exception:
+        env.close()
+        f.close()
+        raise
+
     return env, f, demo_group
 
 
@@ -712,25 +919,59 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--camera_names", nargs="+",
                    default=list(DEFAULT_CAMERA_NAMES),
                    help=(
-                       "Camera names to render. Defaults to the fixed "
-                       "external pair ``birdview sideview`` so exported clips "
-                       "match the intended 2-camera evaluation setup without "
-                       "introducing moving wrist-camera geometry. Pass a "
-                       "different subset if you need a custom export."
+                       "Camera names to render. Defaults to ``frontview sideview "
+                       "birdview``, positioned by the oblique_triplet layout."
                    ))
+    p.add_argument(
+        "--camera_layout",
+        choices=[
+            CAMERA_LAYOUT_NATIVE,
+            CAMERA_LAYOUT_OBLIQUE_PAIR,
+            CAMERA_LAYOUT_OBLIQUE_TRIPLET,
+        ],
+        default=CAMERA_LAYOUT_OBLIQUE_TRIPLET,
+        help=(
+            "Fixed external camera layout. oblique_triplet places frontview and "
+            "sideview at +/-60 degrees plus birdview above the workspace "
+            "(default)."
+        ),
+    )
     p.add_argument("--camera_height", type=int, default=H_RELEASE)
     p.add_argument("--camera_width", type=int, default=W_RELEASE)
     p.add_argument("--gripper_eef_body", default="gripper0_eef",
                    help="MuJoCo body name for the gripper EEF reference frame.")
     p.add_argument("--robot_points_per_body", type=int, default=64,
                    help="Mesh vertices to sample per gripper sub-body.")
+    p.add_argument(
+        "--trajectory_source",
+        choices=["recorded", "replay"],
+        default="recorded",
+        help=(
+            "Use recorded HDF5 states for every future frame (default), or "
+            "replay actions for debugging. Recorded states avoid contact "
+            "divergence and are required for faithful GT visualization."
+        ),
+    )
     p.add_argument("--output", "-o", required=True, help="Output .npz path.")
     return p.parse_args()
 
 
-def main() -> None:
-    args = _parse_args()
+def export_clip_from_args(args: argparse.Namespace) -> dict[str, object]:
+    """Export one fixed-horizon clip from a parsed CLI-like namespace.
+
+    Keeping this callable lets trajectory tooling reuse the exact exporter
+    rather than maintaining a second replay implementation.
+    """
     t_start = time.time()
+    trajectory_source = str(getattr(args, "trajectory_source", "recorded"))
+    camera_layout = str(
+        getattr(args, "camera_layout", CAMERA_LAYOUT_OBLIQUE_TRIPLET)
+    )
+    if trajectory_source not in {"recorded", "replay"}:
+        raise ValueError(
+            "trajectory_source must be 'recorded' or 'replay', got "
+            f"{trajectory_source!r}"
+        )
 
     # ----------------------------------------------------------------
     # Build the env *exactly* from the demo's own metadata.
@@ -740,6 +981,7 @@ def main() -> None:
         args.camera_height, args.camera_width,
         bddl=args.bddl,
         bddl_search_dirs=args.bddl_search_dir,
+        camera_layout=camera_layout,
     )
     try:
         actions = np.asarray(demo_group["actions"], dtype=np.float32)
@@ -806,25 +1048,25 @@ def main() -> None:
         snapshot_body_poses(env, all_body_names, 0, body_poses_per_t)
 
         # ----------------------------------------------------------------
-        # Replay T_FRAMES - 1 more steps and snapshot. After each step
-        # we also check the sim state against the recorded one
-        # (LIBERO's official ``regenerate_obs_from_state`` style
-        # "replay divergence" check). A non-trivial residual here means
-        # the env's internal dynamics / contact resolution diverged from
-        # the recorded demo, which would invalidate the per-frame body
-        # poses we just snapshotted.
+        # Capture each future state. The HDF5 states are the only exact
+        # ground truth available for a LIBERO demo: action replay can diverge
+        # after contacts and would otherwise make the exported "GT" depend on
+        # a different simulator trajectory. Keep replay as an explicit debug
+        # mode so its residual can still be investigated when necessary.
         # ----------------------------------------------------------------
         max_replay_err = 0.0
         for k in range(T_FRAMES - 1):
-            action = actions[args.start_idx + k]
-            env.step(action)
-            # Replay divergence check (see 指导.md §"另外两个小问题").
             target_state = states[args.start_idx + k + 1]
-            current_state = env.sim.get_state().flatten()
-            err = float(np.linalg.norm(
-                current_state.astype(np.float64) - target_state.astype(np.float64)
-            ))
-            max_replay_err = max(max_replay_err, err)
+            if trajectory_source == "recorded":
+                env.regenerate_obs_from_state(target_state)
+            else:
+                action = actions[args.start_idx + k]
+                env.step(action)
+                current_state = env.sim.get_state().flatten()
+                err = float(np.linalg.norm(
+                    current_state.astype(np.float64) - target_state.astype(np.float64)
+                ))
+                max_replay_err = max(max_replay_err, err)
             per_cam, gpose, gopen = capture_frame(env, args.camera_names)
             for c in args.camera_names:
                 _, depth, _ = per_cam[c]
@@ -832,10 +1074,13 @@ def main() -> None:
             gripper_poses.append(gpose)
             gripper_opens.append(gopen)
             snapshot_body_poses(env, all_body_names, k + 1, body_poses_per_t)
-        print(
-            f"replay divergence: max state err over clip = {max_replay_err:.4f}",
-            file=sys.stderr,
-        )
+        if trajectory_source == "replay":
+            print(
+                f"replay divergence: max state err over clip = {max_replay_err:.4f}",
+                file=sys.stderr,
+            )
+        else:
+            print("trajectory source: recorded HDF5 states", file=sys.stderr)
 
         # ----------------------------------------------------------------
         # Build the in-memory sample.
@@ -887,7 +1132,13 @@ def main() -> None:
             gripper_opens, dtype=np.float32
         ).reshape(T_FRAMES, 1)
     finally:
-        h5_file.close()
+        # Trajectory export invokes this function once per window. Releasing
+        # the MuJoCo / OSMesa context here prevents renderer resources from
+        # accumulating across a full demo.
+        try:
+            env.close()
+        finally:
+            h5_file.close()
 
     # ----------------------------------------------------------------
     # Save.
@@ -904,6 +1155,19 @@ def main() -> None:
         f"elapsed={time.time() - t_start:.1f}s",
         file=sys.stderr,
     )
+    return {
+        "output": str(out_path),
+        "start_idx": int(args.start_idx),
+        "end_idx": int(args.start_idx + T_FRAMES - 1),
+        "camera_names": [str(name) for name in args.camera_names],
+        "robot_points": int(robot_flows.shape[1]),
+        "trajectory_source": trajectory_source,
+        "camera_layout": camera_layout,
+    }
+
+
+def main() -> None:
+    export_clip_from_args(_parse_args())
 
 
 if __name__ == "__main__":

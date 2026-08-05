@@ -160,6 +160,7 @@ def build_rainbow_flow_timeline(
     *,
     colormap: Callable[[np.ndarray], np.ndarray],
     min_brightness: float,
+    transition_mask: np.ndarray | None = None,
 ) -> FlowTimeline:
     pts = _ensure_float32(positions)
     mask = np.asarray(exists, dtype=bool)
@@ -169,6 +170,15 @@ def build_rainbow_flow_timeline(
         raise ValueError("exists mask must match positions (T, N)")
 
     T, N = pts.shape[:2]
+    transitions = None
+    if transition_mask is not None:
+        transitions = np.asarray(transition_mask, dtype=bool)
+        expected_shape = (max(T - 1, 0), N)
+        if transitions.shape != expected_shape:
+            raise ValueError(
+                "transition_mask must have shape "
+                f"(T-1, N)={expected_shape}, got {transitions.shape}"
+            )
     if T == 0 or N == 0:
         return FlowTimeline.empty(T)
 
@@ -183,6 +193,8 @@ def build_rainbow_flow_timeline(
     for n in range(N):
         for t in range(T - 1):
             if not (mask[t, n] and mask[t + 1, n]):
+                continue
+            if transitions is not None and not transitions[t, n]:
                 continue
             seg = pts[[t, t + 1], n, :]
             if not np.all(np.isfinite(seg)):
@@ -210,6 +222,7 @@ def build_constant_flow_timeline(
     active_mask: np.ndarray | None,
     color_rgb: Sequence[int],
     min_brightness: float,
+    transition_mask: np.ndarray | None = None,
 ) -> FlowTimeline:
     pts = _ensure_float32(positions)
     mask = np.asarray(exists, dtype=bool)
@@ -219,6 +232,15 @@ def build_constant_flow_timeline(
         raise ValueError("exists mask must match positions (T, N)")
 
     T, N = pts.shape[:2]
+    transitions = None
+    if transition_mask is not None:
+        transitions = np.asarray(transition_mask, dtype=bool)
+        expected_shape = (max(T - 1, 0), N)
+        if transitions.shape != expected_shape:
+            raise ValueError(
+                "transition_mask must have shape "
+                f"(T-1, N)={expected_shape}, got {transitions.shape}"
+            )
     if T == 0 or N == 0:
         return FlowTimeline.empty(T)
 
@@ -241,6 +263,8 @@ def build_constant_flow_timeline(
             continue
         for t in range(T - 1):
             if not (mask[t, n] and mask[t + 1, n]):
+                continue
+            if transitions is not None and not transitions[t, n]:
                 continue
             seg = pts[[t, t + 1], n, :]
             if not np.all(np.isfinite(seg)):
