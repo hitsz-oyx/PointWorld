@@ -52,18 +52,51 @@ class Trainer:
         # ----------------------------------------------------------------------------------
         self.exp_name, self.wandb_id = self.setup_wandb(exp_name=self.args.exp_name)
         self.save_dir = self.setup_save_dir(exp_name=self.exp_name)
-        checkpoint = self.load_checkpoint_from_path(self.args.model_path)
+        # When ``--finetune_from`` is set, the checkpoint is used **only** to
+        # initialize model weights: we still want the structural model
+        # contract (ptv3_size, max_scene_points, ...) but explicitly do
+        # **not** want the data contract (domains, ...) or the optimizer /
+        # training counters.  The cleanest way to handle this is to
+        # load the checkpoint here, apply only the model contract, and
+        # route the model-state load through ``load_finetune_weights``
+        # below (skipping the regular ``load_checkpoint`` path).
+        self.finetune_from = getattr(self.args, "finetune_from", "") or ""
+        checkpoint = self.load_checkpoint_from_path(
+            self.args.model_path if not self.finetune_from else self.finetune_from
+        )
         if checkpoint is not None:
-            context = f"training checkpoint '{self.args.model_path}'"
+            context = f"training checkpoint '{self.finetune_from or self.args.model_path}'"
             model_contract, _ = read_checkpoint_contract(checkpoint, context=context)
-            changed = apply_model_contract_to_args(
-                self.args,
-                model_contract,
-                context=context,
-                explicit_cli_dests=set(getattr(self.args, "_explicit_cli_dests", set())),
-            )
-            if changed and self.rank == 0:
-                _print("Applied canonical checkpoint model_contract for model initialization.")
+            if self.finetune_from:
+                # Fine-tune mode: apply ONLY the model contract
+                # (structural params such as ptv3_size, max_scene_points,
+                # etc.) and leave data contract (domains) alone. The
+                # caller is expected to have supplied their own
+                # ``--domains`` and ``--norm_stats_path``.
+                _print(
+                    "Fine-tune mode: applying model_contract only "
+                    "(skipping data_contract 'domains' so the new "
+                    "run uses its own --domains / --norm_stats_path)."
+                )
+                explicit_cli_dests = set(
+                    getattr(self.args, "_explicit_cli_dests", set())
+                )
+                apply_model_contract_to_args(
+                    self.args,
+                    model_contract,
+                    context=context,
+                    explicit_cli_dests=explicit_cli_dests,
+                    skip_data_contract=True,
+                )
+            else:
+                changed = apply_model_contract_to_args(
+                    self.args,
+                    model_contract,
+                    context=context,
+                    explicit_cli_dests=set(getattr(self.args, "_explicit_cli_dests", set())),
+                )
+                if changed and self.rank == 0:
+                    _print("Applied canonical checkpoint model_contract for model initialization.")
 
         if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
             self.amp_dtype = torch.bfloat16
@@ -138,7 +171,24 @@ class Trainer:
         self.sample_count = 0
         # load model state dict and update counters
         if checkpoint is not None:
-            self.load_checkpoint(checkpoint)
+            if self.finetune_from:
+                # Fine-tune path: only load learnable weights, skip
+                # optimizer / counters / data contract.  The model
+                # was already built with the new domain's
+                # normalization buffers, so the skipped
+                # ``NORM_BUFFER_NAMES`` keys are filled in by the
+                # BaseModel constructor from ``--norm_stats_path``.
+                if self.rank == 0:
+                    _print(
+                        f"Fine-tune: loading weights from "
+                        f"{self.finetune_from} (skipping optimizer / "
+                        f"counters / data contract)"
+                    )
+                checkpointing_utils.load_finetune_weights(
+                    self.model, self.finetune_from,
+                )
+            else:
+                self.load_checkpoint(checkpoint)
         # Recompute epoch_count from samples seen if training
         if not self.inference_only:
             self.epoch_count = self.sample_count / float(self.train_total_samples)
@@ -367,7 +417,7 @@ class Trainer:
 
         # Only call GradScaler if AMP
         scaler = GradScaler('cuda')
-        
+
         last_save_batch = 0 if self.args.save_freq > 0 else -1
         # Initialize cadence tracking with negative values to ensure first iteration triggers
         last_eval_batch = -self.args.eval_freq if self.args.eval_freq > 0 else -1
@@ -378,7 +428,7 @@ class Trainer:
                 tepoch = tqdm(total=len(self.train_dataloader),
                               desc=f'Initializing...',  # Will be updated in the loop
                               leave=False)
-            
+
             # Iterate through one epoch using the shared train_iter
             for train_batch_idx in range(len(self.train_dataloader)):
                 # Get next batch from shared iterator

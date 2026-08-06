@@ -45,6 +45,13 @@ from typing import Sequence
 import h5py
 import numpy as np
 
+# Headless EGL compatibility shim.  Must run before any ``robosuite`` /
+# ``libero`` import, otherwise ``mujoco.egl.egl_ext`` will fail to import
+# because PyOpenGL does not expose ``EGLDeviceEXT`` by default.  See
+# ``tools.libero._egl_compat`` for details.
+from tools.libero import _egl_compat  # type: ignore[import-not-found]
+_egl_compat.apply()
+
 # LIBERO / robosuite imports. These are only available in the LIBERO env.
 # IMPORTANT: this module MUST be imported with ``IMAGE_CONVENTION = "opencv"``
 # set on robosuite's global macro singleton. The LIBERO HDF5 demos are recorded

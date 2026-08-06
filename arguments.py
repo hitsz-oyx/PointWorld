@@ -95,6 +95,26 @@ def parse_args(skip_command_line=False):
     parser.add_argument('--save_freq', '-sf', type=int, default=1800, help='Save checkpoint every N batches (equivalent to seconds in previous version)')
     parser.add_argument('--num_eval_batches', '-ntb', type=int, default=10)
     parser.add_argument('--model_path', type=str, required=False, help='Path to the model checkpoint to load')
+    parser.add_argument(
+        '--finetune_from', type=str, default="",
+        help=(
+            "Initialize model weights from a pre-trained checkpoint without "
+            "restoring optimizer state or training counters. Skips dataset-"
+            "derived fields (domains, norm_stats_path) from the checkpoint's "
+            "data contract so the new run uses its own --domains / "
+            "--norm_stats_path / --data_dirs."
+        ),
+    )
+    parser.add_argument(
+        '--dataset_format', type=str, default="webdataset",
+        choices=["webdataset", "libero_npz"],
+        help=(
+            "Dataset layout. 'webdataset' reads .tar shards under "
+            "<data_dir>/<split>/ (DROID / BEHAVIOR); 'libero_npz' reads "
+            ".npz files recursively under <data_dir> using the LIBERO "
+            "clip schema produced by tools/libero/export_clip_native.py."
+        ),
+    )
     parser.add_argument('--allow_optimizer_reset', type=str, default='false',
                         help='Allow optimizer reset if checkpoint optimizer state is incompatible')
     parser.add_argument('--grad_clip_max_norm', '-gcmn', type=float, default=5.0)

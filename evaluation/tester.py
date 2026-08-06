@@ -17,6 +17,7 @@ import os
 import json
 import math
 import sys
+import time
 from pathlib import Path
 import numpy as np
 import torch
@@ -424,6 +425,28 @@ class Tester(Trainer):
                         break
         finally:
             if live_session is not None:
+                # When PW_KEEP_VISER_OPEN is set, keep the viser server alive so
+                # the user can open the URL in their browser without racing the
+                # process exit. The timeout (seconds) is read from the same env
+                # var (default 600s).
+                keep_seconds_raw = os.environ.get("PW_KEEP_VISER_OPEN", "")
+                if keep_seconds_raw.strip() and keep_seconds_raw.strip().lower() not in {
+                    "0", "false", "no", "off",
+                }:
+                    try:
+                        keep_seconds = float(keep_seconds_raw)
+                    except ValueError:
+                        keep_seconds = 600.0
+                    print(
+                        f"[viz] Keeping viser server alive for {keep_seconds:.0f}s. "
+                        f"Open the URL reported above in your browser. "
+                        f"Press Ctrl-C in the launching terminal to stop early."
+                    )
+                    sys.stdout.flush()
+                    try:
+                        time.sleep(keep_seconds)
+                    except KeyboardInterrupt:
+                        print("[viz] Interrupted; shutting down viser server.")
                 live_session.close()
 
     @staticmethod
@@ -431,6 +454,12 @@ class Tester(Trainer):
         prompt = "Press ENTER to continue to the next eval sample (type q to quit visualization): "
         if sys.stdin is not None and sys.stdin.isatty():
             return input(prompt)
+        # Headless / background mode: if PW_VIZ_AUTO_CONTINUE is set we
+        # silently advance; otherwise we fall back to /dev/tty. This keeps
+        # interactive flows unchanged while letting `eval.py` run from a
+        # plain shell.
+        if os.environ.get("PW_VIZ_AUTO_CONTINUE", "").lower() in ("1", "true", "yes"):
+            return ""
         try:
             with open("/dev/tty", "r") as tty:
                 sys.stdout.write(prompt)

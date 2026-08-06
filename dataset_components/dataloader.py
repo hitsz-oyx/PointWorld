@@ -192,6 +192,15 @@ def build_dataset(data_dir, domain, mode, args, rank=0, has_bimanual_robot=False
 
 
 def build_dataloader(args, mode, rank=0, world_size=1, override_splits=None, force_resampled_eval=False):
+    # ------------------------------------------------------------------
+    # LIBERO .npz path: bypass WebDataset and use a regular torch
+    # DataLoader over LiberoNPZDataset. This is the only entry point
+    # that supports fine-tuning on a small LIBERO clip set.
+    # ------------------------------------------------------------------
+    dataset_format = getattr(args, 'dataset_format', 'webdataset')
+    if dataset_format == 'libero_npz':
+        return _build_libero_dataloader(args, mode, rank, world_size)
+
     assert isinstance(args.data_dirs, list), f'expected data_dirs to be a list, got {args.data_dirs}'
     assert isinstance(args.domains, list), f'expected domains to be a list, got {args.domains}'
     assert len(args.data_dirs) == len(args.domains), f'expected data_dirs and domains to have one to one mapping, got {len(args.data_dirs)} and {len(args.domains)}'
@@ -311,3 +320,109 @@ def aggregate_dataset_metadata(data_dir: str, split: str) -> int:
         total_count += metadata[split]["processed_count"]
 
     return total_count
+
+
+# ---------------------------------------------------------------------------
+# LIBERO .npz dataloader (torch DataLoader over LiberoNPZDataset).
+# ---------------------------------------------------------------------------
+
+def _resolve_libero_data_dir(args, mode: str) -> str:
+    """Return the data directory used for the libero_npz dataloader.
+
+    Precedence:
+
+    1. ``--libero_data_dir_<mode>`` if the user passed it (most explicit).
+    2. ``--data_dirs`` (single-element list, libero convention).
+    3. ``--data_dir_<mode>`` for backward compat.
+    """
+    explicit = getattr(args, f"libero_data_dir_{mode}", None)
+    if explicit:
+        return explicit
+    if args.data_dirs:
+        assert len(args.data_dirs) == 1, (
+            f"libero_npz expects exactly one --data_dirs entry, got {args.data_dirs}"
+        )
+        return args.data_dirs[0]
+    fallback = getattr(args, f"data_dir_{mode}", None)
+    if fallback:
+        return fallback
+    raise RuntimeError(
+        f"libero_npz dataloader for mode={mode!r} could not resolve a data "
+        f"directory. Pass --libero_data_dir_{mode}=... (or --data_dirs=...)."
+    )
+
+
+def _build_libero_dataloader(args, mode, rank=0, world_size=1):
+    """Build a regular ``torch.utils.data.DataLoader`` for LIBERO .npz.
+
+    Returns the same ``(dataloader, info)`` shape the WebDataset path
+    returns so :class:`training.trainer.Trainer.setup_dataloader` does
+    not need to know which format it is dealing with.
+    """
+    # Imports local to keep the WebDataset import cost off the libero
+    # code path when only the WDS path is used.
+    from functools import partial
+    from torch.utils.data import DataLoader
+    from dataset_components.libero_dataset import LiberoNPZDataset
+    from dataset_components.collate import custom_collate_fn
+
+    data_dir = _resolve_libero_data_dir(args, mode)
+    if mode == 'train':
+        num_cameras = getattr(args, 'train_max_num_cameras', 2)
+    else:
+        num_cameras = getattr(args, 'eval_max_num_cameras', 2)
+    num_cameras = int(num_cameras)
+    domain = args.domains[0] if args.domains else 'libero'
+
+    dataset = LiberoNPZDataset(
+        root=data_dir,
+        mode=mode,
+        args=args,
+        num_cameras=num_cameras,
+        domain=domain,
+    )
+    if rank == 0:
+        print(
+            f"[{domain}] {mode} num_samples={len(dataset)} "
+            f"(data_dir={data_dir}, num_cameras={num_cameras})"
+        )
+
+    # Distributed sharding: split sample indices across ranks so each
+    # rank sees a different chunk of the dataset (matches the WDS
+    # behavior of wds.split_by_node / nodesplitter).
+    total = len(dataset)
+    per_rank = (total + world_size - 1) // world_size
+    start = rank * per_rank
+    end = min(start + per_rank, total)
+    indices = list(range(start, end))
+    if rank == 0:
+        print(
+            f"[{domain}] {mode} rank split: rank=0 owns [{start}, {end}) of {total}"
+        )
+
+    from torch.utils.data import Subset
+    sub = Subset(dataset, indices)
+
+    num_workers = 0 if mode == 'train' and args.deterministic_train else min(
+        getattr(args, 'num_workers', 4), 4,
+    )
+
+    dataloader = DataLoader(
+        sub,
+        batch_size=int(args.batch_size),
+        shuffle=(mode == 'train' and not args.deterministic_train),
+        num_workers=num_workers,
+        collate_fn=partial(custom_collate_fn, args=args),
+        pin_memory=True,
+        drop_last=False,
+        persistent_workers=(num_workers > 0),
+    )
+
+    total_batches_needed = (len(indices) + int(args.batch_size) - 1) // int(args.batch_size)
+    info = {
+        'total_samples': int(total),
+        'total_batches_needed': int(total_batches_needed),
+        'batches_per_rank': int(total_batches_needed),
+        'world_size': int(world_size),
+    }
+    return dataloader, info

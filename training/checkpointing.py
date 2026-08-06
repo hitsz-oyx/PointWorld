@@ -13,7 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import os
+from pathlib import Path
+
 import torch
 import torch.distributed as dist
 from utils import _print
@@ -22,6 +26,100 @@ from pointworld.checkpoint_contract import attach_checkpoint_contract
 
 def _unwrap_model(model):
     return model.module if hasattr(model, "module") else model
+
+
+# Names of buffers/parameters that hold the *precomputed* dataset
+# normalization statistics.  These are populated at training time
+# from the JSON file under ``--norm_stats_path``; they are *not* a
+# learnable part of the network.  When we fine-tune a pre-trained
+# model on a new dataset, we want the network weights to come from
+# the source checkpoint but the normalization statistics to come
+# from the new dataset's stats JSON.  The downstream training code
+# re-creates the normalization buffers after the model is built,
+# so we strip these keys from the loaded state dict.
+NORM_BUFFER_NAMES = (
+    "norm_stats_per_step_mean",
+    "norm_stats_per_step_var",
+    "robot_norm_mean",
+    "robot_norm_var",
+    "scene_norm_mean",
+    "scene_norm_var",
+)
+
+
+def _is_norm_buffer(key: str) -> bool:
+    return any(key.endswith(name) for name in NORM_BUFFER_NAMES)
+
+
+def load_finetune_weights(model, checkpoint_path: str) -> None:
+    """Load a pre-trained ``model_state_dict`` into ``model`` for fine-tuning.
+
+    This is the fine-tune counterpart to
+    :func:`load_checkpoint`: it loads only the learnable model
+    weights, skips the dataset-derived normalization buffers, and
+    **does not** touch the optimizer or training counters.  Missing
+    keys are allowed only for the normalization buffers; the rest
+    of the model state dict must match the checkpoint exactly.
+
+    Use this when transferring a network trained on DROID/BEHAVIOR
+    to a new domain (e.g. LIBERO).  The downstream training code
+    then re-creates the ``NORM_BUFFER_NAMES`` from
+    ``args.norm_stats_path`` so the new run uses its own dataset
+    statistics.
+    """
+    checkpoint_path = Path(checkpoint_path)
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(checkpoint_path)
+    checkpoint = torch.load(
+        str(checkpoint_path),
+        map_location="cpu",
+        weights_only=False,
+    )
+    if "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    elif "model" in checkpoint:
+        state_dict = checkpoint["model"]
+    else:
+        raise KeyError(
+            f"checkpoint {checkpoint_path} has neither 'model' nor "
+            f"'model_state_dict' keys; cannot fine-tune from it."
+        )
+
+    cleaned = {}
+    for k, v in state_dict.items():
+        # Strip DDP 'module.' prefix if present.
+        if k.startswith("module."):
+            k = k[len("module."):]
+        if _is_norm_buffer(k):
+            continue
+        cleaned[k] = v
+
+    model_to_load = _unwrap_model(model)
+    result = model_to_load.load_state_dict(cleaned, strict=False)
+    unexpected = set(result.unexpected_keys)
+    missing = set(result.missing_keys)
+    # Norm buffers are allowed to be missing: they will be set from
+    # the LIBERO (or other new-domain) stats JSON.
+    expected_missing = {
+        k for k in model_to_load.state_dict() if _is_norm_buffer(k)
+    }
+    invalid_missing = missing - expected_missing
+    if unexpected:
+        raise RuntimeError(
+            f"Unexpected keys in fine-tune checkpoint: {sorted(unexpected)[:20]}"
+        )
+    if invalid_missing:
+        raise RuntimeError(
+            f"Unexpected missing model keys after fine-tune load: "
+            f"{sorted(invalid_missing)[:20]}"
+        )
+    _print(
+        f"Loaded fine-tune weights from {checkpoint_path} "
+        f"(stripped NORM_BUFFER_NAMES; "
+        f"{len(cleaned)} params loaded, "
+        f"{len(expected_missing)} norm buffers reinitialised from "
+        f"--norm_stats_path)"
+    )
 
 
 def save_checkpoint_now(trainer, adjusted_batch_count, log_dict=None):

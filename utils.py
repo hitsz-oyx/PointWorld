@@ -92,6 +92,10 @@ def resolve_default_robot_urdf(domains) -> str:
         return ROBOT_URDF_BY_DOMAIN["droid"]
     if any("behavior" in d for d in doms):
         return ROBOT_URDF_BY_DOMAIN["behavior"]
+    # LIBERO simulations also use a Franka Panda; the URDF is geometry-compatible
+    # enough for kinematics/rendering overlays during visualization.
+    if any("libero" in d for d in doms):
+        return ROBOT_URDF_BY_DOMAIN["droid"]
     raise ValueError(f"Unsupported domains for robot URDF: {domains}")
 
 

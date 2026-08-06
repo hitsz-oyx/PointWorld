@@ -228,12 +228,34 @@ def apply_model_contract_to_args(
     *,
     context: str,
     explicit_cli_dests: set[str] | None = None,
+    skip_data_contract: bool = False,
 ) -> list[str]:
+    """Apply the checkpoint's model contract to ``args`` in-place.
+
+    When ``skip_data_contract`` is True, also skip the fields listed
+    in :data:`DATA_CONTRACT_KEYS` (``domains``) so that the new run
+    uses its own ``--domains`` / ``--norm_stats_path`` rather than
+    inheriting the source checkpoint's data contract.  This is the
+    correct behaviour for fine-tuning a pre-trained model on a new
+    dataset.
+    """
     validated_contract = _validate_model_contract(model_contract, context)
     if explicit_cli_dests is None:
         explicit_cli_dests = set(getattr(args, "_explicit_cli_dests", set()))
+    # Fields that should always follow the CLI rather than the source
+    # checkpoint when we are fine-tuning on a new dataset. ``domains`` is
+    # already covered by ``DATA_CONTRACT_KEYS``; we additionally skip
+    # ``norm_stats_path`` so a fine-tune run can use a fresh stats folder
+    # without triggering a CLI-vs-checkpoint mismatch.
+    finetune_skip_keys: set[str] = set()
+    if skip_data_contract:
+        finetune_skip_keys.add("norm_stats_path")
     changed: list[str] = []
     for key, target_value in validated_contract.items():
+        if skip_data_contract and key in DATA_CONTRACT_KEYS:
+            continue
+        if key in finetune_skip_keys:
+            continue
         current_value = getattr(args, key, None)
         if key in explicit_cli_dests and current_value != target_value:
             raise RuntimeError(

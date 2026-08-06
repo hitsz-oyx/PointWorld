@@ -662,6 +662,8 @@ class PredictionVisualizer:
                     default_gt_checked=(pred_positions is None),
                     exists_mask=exists_mask,
                     pred_positions_orig=pred_positions,
+                    scene_transition_mask=scene_transition_mask,
+                    robot_transition_mask=robot_transition_mask,
                     scene_point_size=scene_point_size,
                     robot_point_size=robot_point_size,
                 )
