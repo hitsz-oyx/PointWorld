@@ -327,29 +327,70 @@ def aggregate_dataset_metadata(data_dir: str, split: str) -> int:
 # ---------------------------------------------------------------------------
 
 def _resolve_libero_data_dir(args, mode: str) -> str:
-    """Return the data directory used for the libero_npz dataloader.
+    """Return one isolated split directory for the LIBERO NPZ loader.
 
-    Precedence:
+    ``mode='test'`` is the trainer's validation loader.  A shared
+    ``--data_dirs=<root>`` is safe only when it contains explicit ``train/``
+    and ``val/`` children; returning the root itself would make both map-style
+    datasets recursively consume every NPZ and leak validation clips into
+    training.
 
-    1. ``--libero_data_dir_<mode>`` if the user passed it (most explicit).
-    2. ``--data_dirs`` (single-element list, libero convention).
-    3. ``--data_dir_<mode>`` for backward compat.
+    Explicit split flags take precedence.  ``--libero_data_dir_test`` and
+    ``--data_dir_<mode>`` remain readable for old programmatic callers, but
+    the public CLI calls the evaluation split ``--libero_data_dir_val``.
     """
-    explicit = getattr(args, f"libero_data_dir_{mode}", None)
+    if mode not in ("train", "test"):
+        raise ValueError(f"Unsupported LIBERO dataloader mode: {mode!r}")
+
+    explicit_name = "libero_data_dir_train" if mode == "train" else "libero_data_dir_val"
+    explicit = getattr(args, explicit_name, None)
+    if mode == "test" and not explicit:
+        explicit = getattr(args, "libero_data_dir_test", None)
     if explicit:
-        return explicit
-    if args.data_dirs:
+        resolved = os.path.realpath(os.path.abspath(explicit))
+    elif args.data_dirs:
         assert len(args.data_dirs) == 1, (
             f"libero_npz expects exactly one --data_dirs entry, got {args.data_dirs}"
         )
-        return args.data_dirs[0]
-    fallback = getattr(args, f"data_dir_{mode}", None)
-    if fallback:
-        return fallback
-    raise RuntimeError(
-        f"libero_npz dataloader for mode={mode!r} could not resolve a data "
-        f"directory. Pass --libero_data_dir_{mode}=... (or --data_dirs=...)."
-    )
+        root = os.path.realpath(os.path.abspath(args.data_dirs[0]))
+        split_names = ("train",) if mode == "train" else ("val", "test")
+        candidates = [os.path.join(root, name) for name in split_names]
+        existing = [candidate for candidate in candidates if os.path.isdir(candidate)]
+        if not existing:
+            raise FileNotFoundError(
+                f"LIBERO {mode} split not found under {root}. Expected one of: "
+                f"{candidates}. Do not point both loaders at the shared root; "
+                f"create train/val subdirectories or pass --{explicit_name}."
+            )
+        resolved = existing[0]
+    else:
+        fallback = getattr(args, f"data_dir_{mode}", None)
+        if not fallback:
+            raise RuntimeError(
+                f"libero_npz dataloader for mode={mode!r} could not resolve a data "
+                f"directory. Pass --{explicit_name}=... or --data_dirs=<split-root>."
+            )
+        resolved = os.path.realpath(os.path.abspath(fallback))
+
+    if not os.path.isdir(resolved):
+        raise FileNotFoundError(f"LIBERO {mode} split directory not found: {resolved}")
+
+    # Catch the most dangerous explicit-configuration mistake even when only
+    # one of the two dataloaders is being constructed.
+    other_name = "libero_data_dir_val" if mode == "train" else "libero_data_dir_train"
+    other = getattr(args, other_name, None)
+    if other:
+        other_resolved = os.path.realpath(os.path.abspath(other))
+        try:
+            overlap = os.path.commonpath([resolved, other_resolved]) in {resolved, other_resolved}
+        except ValueError:
+            overlap = False
+        if overlap:
+            raise ValueError(
+                "LIBERO train and validation directories must be disjoint; got "
+                f"{resolved!r} and {other_resolved!r}."
+            )
+    return resolved
 
 
 def _build_libero_dataloader(args, mode, rank=0, world_size=1):

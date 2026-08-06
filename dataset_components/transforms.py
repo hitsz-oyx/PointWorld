@@ -70,7 +70,16 @@ def sphere_crop_transform(
 ) -> dict:
     """
     Multi-sphere probabilistic SphereCrop for temporal scene/robot flow data.
+
+    Export-time LIBERO workspace crops already remove the far background this
+    augmentation targets.  Applying both would double-crop the scene and can
+    reduce an 8k-point tabletop cloud to roughly 4k points, so the explicit
+    ``workspace_bounds`` metadata opts the sample out of sphere cropping.
     """
+    if sample.get("workspace_bounds") is not None:
+        sample["__sphere_crop_skipped_workspace__"] = True
+        return sample
+
     if np.random.rand() > prob:
         return sample
 

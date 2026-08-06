@@ -42,11 +42,16 @@ T_FRAMES = 11                 # 1 context + 10 predicted frames
 CONTEXT_HORIZON = 1
 H_RELEASE = 180
 W_RELEASE = 320
+DEFAULT_CONTROL_FREQ_HZ = 20.0
+DEFAULT_FRAME_STEP = 2        # 20 Hz LIBERO -> PointWorld's 0.1 s step
 
 # Two fixed oblique views plus birdview provide complementary coverage of
 # tabletop objects. The inference bridge keeps their on-disk order fixed.
 DEFAULT_CAMERAS = ("camera_0", "camera_1")
 DEFAULT_CAMERA_NAMES = ("frontview", "sideview", "birdview")
+# Conservative tabletop workspace in the canonical LIBERO world frame.
+# Exporters keep the upstream behaviour unless --workspace_bounds is passed.
+DEFAULT_WORKSPACE_BOUNDS = (-0.8, -0.8, 0.65, 0.8, 0.8, 1.5)
 
 
 def _as_float32(x):
@@ -87,6 +92,14 @@ def empty_clip() -> dict:
         "right_gripper_open": np.zeros((T_FRAMES, 1), dtype=np.float32),
         "camera_names": np.array([], dtype=object),
         "point_object_names": np.array([], dtype=object),
+        "workspace_bounds": None,
+        "workspace_crop_reference": "",
+        "workspace_points_before_per_cam": np.array([], dtype=np.int64),
+        "workspace_points_after_per_cam": np.array([], dtype=np.int64),
+        "source_control_freq_hz": DEFAULT_CONTROL_FREQ_HZ,
+        "frame_step": DEFAULT_FRAME_STEP,
+        "model_step_seconds": DEFAULT_FRAME_STEP / DEFAULT_CONTROL_FREQ_HZ,
+        "window_stride_raw": None,
     }
     return sample
 
@@ -125,6 +138,15 @@ def save_npz(sample: dict, path: str) -> None:
     flat["right_gripper_pose"] = _as_float32(sample["right_gripper_pose"])
     flat["right_gripper_open"] = _as_float32(sample["right_gripper_open"])
 
+    for key, dtype in (
+        ("source_control_freq_hz", np.float32),
+        ("frame_step", np.int32),
+        ("model_step_seconds", np.float32),
+        ("window_stride_raw", np.int32),
+    ):
+        if sample.get(key) is not None:
+            flat[key] = np.asarray(sample[key], dtype=dtype)
+
     # Metadata.
     flat["__key__"] = np.array(sample["__key__"], dtype=object)
     flat["camera_names"] = np.array(
@@ -133,6 +155,17 @@ def save_npz(sample: dict, path: str) -> None:
     flat["point_object_names"] = np.array(
         sample.get("point_object_names", []), dtype=object
     )
+    if sample.get("workspace_bounds") is not None:
+        flat["workspace_bounds"] = _as_float32(sample["workspace_bounds"])
+        flat["workspace_crop_reference"] = np.array(
+            sample.get("workspace_crop_reference", "t0"), dtype=object
+        )
+        flat["workspace_points_before_per_cam"] = np.asarray(
+            sample.get("workspace_points_before_per_cam", []), dtype=np.int64
+        )
+        flat["workspace_points_after_per_cam"] = np.asarray(
+            sample.get("workspace_points_after_per_cam", []), dtype=np.int64
+        )
 
     np.savez(path, **flat)
 
@@ -190,6 +223,28 @@ def load_npz(path: str) -> dict:
             if "point_object_names" in raw.files
             else []
         ),
+        "workspace_bounds": (
+            np.asarray(raw["workspace_bounds"], dtype=np.float32)
+            if "workspace_bounds" in raw.files else None
+        ),
+        "workspace_crop_reference": (
+            str(raw["workspace_crop_reference"])
+            if "workspace_crop_reference" in raw.files else ""
+        ),
+        "workspace_points_before_per_cam": np.asarray(
+            raw["workspace_points_before_per_cam"], dtype=np.int64
+        ) if "workspace_points_before_per_cam" in raw.files else np.array([], dtype=np.int64),
+        "workspace_points_after_per_cam": np.asarray(
+            raw["workspace_points_after_per_cam"], dtype=np.int64
+        ) if "workspace_points_after_per_cam" in raw.files else np.array([], dtype=np.int64),
+        "source_control_freq_hz": float(raw["source_control_freq_hz"])
+        if "source_control_freq_hz" in raw.files else None,
+        "frame_step": int(raw["frame_step"])
+        if "frame_step" in raw.files else None,
+        "model_step_seconds": float(raw["model_step_seconds"])
+        if "model_step_seconds" in raw.files else None,
+        "window_stride_raw": int(raw["window_stride_raw"])
+        if "window_stride_raw" in raw.files else None,
     }
 
     for prefix in cam_prefixes:
@@ -245,6 +300,70 @@ def load_npz(path: str) -> dict:
             f"right_gripper_open must be ({T_FRAMES}, 1), got {sample['right_gripper_open'].shape}"
         )
 
+    bounds = sample.get("workspace_bounds")
+    if bounds is not None and bounds.shape != (2, 3):
+        raise ValueError(f"workspace_bounds must be (2,3), got {bounds.shape}")
+
+    return sample
+
+
+def crop_scene_to_workspace(sample: dict, bounds) -> dict:
+    """Crop every camera scene to a world-frame box using frame-0 positions.
+
+    The frame-0 decision is applied to every timestep and every aligned scene
+    field.  This preserves particle correspondence while allowing a tracked
+    object to move slightly outside the box later in the 11-frame clip.
+    Camera RGB/depth payloads remain full resolution for 2-D feature lookup.
+    """
+    values = np.asarray(bounds, dtype=np.float32)
+    if values.shape == (6,):
+        values = values.reshape(2, 3)
+    if values.shape != (2, 3):
+        raise ValueError(f"workspace bounds must contain 6 values, got {values.shape}")
+    lower, upper = values
+    if not np.isfinite(values).all() or not np.all(lower < upper):
+        raise ValueError(f"invalid workspace bounds: {values.tolist()}")
+
+    scene_maps = (
+        "scene_flows_per_cam",
+        "scene_colors_per_cam",
+        "scene_normals_per_cam",
+        "scene_visibility_per_cam",
+        "scene_depth_valid_mask_per_cam",
+    )
+    prefixes = list(sample["scene_flows_per_cam"])
+    before = []
+    after = []
+    for prefix in prefixes:
+        flows = sample["scene_flows_per_cam"][prefix]
+        point_count = int(flows.shape[1])
+        xyz0 = flows[0]
+        keep = np.isfinite(xyz0).all(axis=1) & np.all(
+            (xyz0 >= lower) & (xyz0 <= upper), axis=1
+        )
+        if not keep.any():
+            raise ValueError(
+                f"workspace crop removed every point from {prefix}; "
+                f"bounds={values.tolist()}"
+            )
+        for map_name in scene_maps:
+            camera_map = sample[map_name]
+            if prefix not in camera_map:
+                continue
+            array = camera_map[prefix]
+            if array.shape[:2] != (T_FRAMES, point_count):
+                raise ValueError(
+                    f"{map_name}[{prefix}] is not aligned with scene flows: "
+                    f"{array.shape} vs {flows.shape}"
+                )
+            camera_map[prefix] = array[:, keep, ...]
+        before.append(point_count)
+        after.append(int(keep.sum()))
+
+    sample["workspace_bounds"] = values
+    sample["workspace_crop_reference"] = "t0_world_frame"
+    sample["workspace_points_before_per_cam"] = np.asarray(before, dtype=np.int64)
+    sample["workspace_points_after_per_cam"] = np.asarray(after, dtype=np.int64)
     return sample
 
 
@@ -280,17 +399,35 @@ def flatten_for_pointworld(sample: dict) -> dict:
         out["point_object_names"] = np.asarray(
             sample["point_object_names"], dtype=object
         )
+    if sample.get("workspace_bounds") is not None:
+        out["workspace_bounds"] = np.asarray(sample["workspace_bounds"], dtype=np.float32)
+        out["workspace_crop_reference"] = sample.get("workspace_crop_reference", "")
+        out["workspace_points_before_per_cam"] = np.asarray(
+            sample.get("workspace_points_before_per_cam", []), dtype=np.int64
+        )
+        out["workspace_points_after_per_cam"] = np.asarray(
+            sample.get("workspace_points_after_per_cam", []), dtype=np.int64
+        )
+    for key in (
+        "source_control_freq_hz", "frame_step", "model_step_seconds", "window_stride_raw"
+    ):
+        if sample.get(key) is not None:
+            out[key] = sample[key]
     return out
 
 
 __all__ = [
     "T_FRAMES",
+    "DEFAULT_CONTROL_FREQ_HZ",
+    "DEFAULT_FRAME_STEP",
     "CONTEXT_HORIZON",
     "H_RELEASE",
     "W_RELEASE",
     "DEFAULT_CAMERAS",
     "DEFAULT_CAMERA_NAMES",
+    "DEFAULT_WORKSPACE_BOUNDS",
     "empty_clip",
+    "crop_scene_to_workspace",
     "save_npz",
     "load_npz",
     "flatten_for_pointworld",

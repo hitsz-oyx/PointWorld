@@ -158,9 +158,13 @@ def _rewrite_libero_asset_paths(xml_str: str) -> str:
 
 from .sample_schema import (
     DEFAULT_CAMERA_NAMES,
+    DEFAULT_CONTROL_FREQ_HZ,
+    DEFAULT_FRAME_STEP,
+    DEFAULT_WORKSPACE_BOUNDS,
     T_FRAMES,
     H_RELEASE,
     W_RELEASE,
+    crop_scene_to_workspace,
     empty_clip,
     save_npz,
 )
@@ -902,6 +906,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--start_idx", type=int, required=True,
                    help="Index in the demo to use as the context frame.")
     p.add_argument(
+        "--frame_step", type=int, default=DEFAULT_FRAME_STEP,
+        help="Raw 20 Hz LIBERO states per 0.1 s PointWorld step (default: 2).",
+    )
+    p.add_argument(
+        "--window_stride_raw", type=int, default=None,
+        help="Optional raw-index window stride recorded as NPZ metadata.",
+    )
+    p.add_argument(
         "--bddl",
         default=None,
         help=(
@@ -950,6 +962,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--robot_points_per_body", type=int, default=64,
                    help="Mesh vertices to sample per gripper sub-body.")
     p.add_argument(
+        "--workspace_bounds", nargs=6, type=float, default=None,
+        metavar=("XMIN", "YMIN", "ZMIN", "XMAX", "YMAX", "ZMAX"),
+        help=(
+            "Optional frame-0 LIBERO world-frame crop. Recommended tabletop "
+            f"bounds: {' '.join(str(v) for v in DEFAULT_WORKSPACE_BOUNDS)}."
+        ),
+    )
+    p.add_argument(
         "--trajectory_source",
         choices=["recorded", "replay"],
         default="recorded",
@@ -993,11 +1013,16 @@ def export_clip_from_args(args: argparse.Namespace) -> dict[str, object]:
     try:
         actions = np.asarray(demo_group["actions"], dtype=np.float32)
         states = np.asarray(demo_group["states"], dtype=np.float32)
+        frame_step = int(getattr(args, "frame_step", DEFAULT_FRAME_STEP))
+        if frame_step < 1:
+            raise ValueError(f"frame_step must be >= 1, got {frame_step}")
+        last_raw_idx = args.start_idx + (T_FRAMES - 1) * frame_step
 
-        if args.start_idx < 0 or args.start_idx + (T_FRAMES - 1) >= len(actions):
+        if args.start_idx < 0 or last_raw_idx >= len(states):
             raise ValueError(
                 f"start_idx={args.start_idx} out of range for demo with "
-                f"{len(actions)} actions (need at least {T_FRAMES - 1} steps left)."
+                f"{len(states)} states (frame_step={frame_step} requires "
+                f"last raw index {last_raw_idx})."
             )
 
         # ----------------------------------------------------------------
@@ -1063,12 +1088,15 @@ def export_clip_from_args(args: argparse.Namespace) -> dict[str, object]:
         # ----------------------------------------------------------------
         max_replay_err = 0.0
         for k in range(T_FRAMES - 1):
-            target_state = states[args.start_idx + k + 1]
+            target_raw_idx = args.start_idx + (k + 1) * frame_step
+            target_state = states[target_raw_idx]
             if trajectory_source == "recorded":
                 env.regenerate_obs_from_state(target_state)
             else:
-                action = actions[args.start_idx + k]
-                env.step(action)
+                for raw_idx in range(
+                    args.start_idx + k * frame_step, target_raw_idx
+                ):
+                    env.step(actions[raw_idx])
                 current_state = env.sim.get_state().flatten()
                 err = float(np.linalg.norm(
                     current_state.astype(np.float64) - target_state.astype(np.float64)
@@ -1093,7 +1121,13 @@ def export_clip_from_args(args: argparse.Namespace) -> dict[str, object]:
         # Build the in-memory sample.
         # ----------------------------------------------------------------
         sample = empty_clip()
-        sample["__key__"] = f"{args.demo_id}-{args.start_idx}:{args.start_idx + T_FRAMES - 1}"
+        sample["__key__"] = f"{args.demo_id}-{args.start_idx}:{last_raw_idx}:step{frame_step}"
+        sample["source_control_freq_hz"] = float(
+            getattr(args, "source_control_freq_hz", DEFAULT_CONTROL_FREQ_HZ)
+        )
+        sample["frame_step"] = frame_step
+        sample["model_step_seconds"] = frame_step / sample["source_control_freq_hz"]
+        sample["window_stride_raw"] = getattr(args, "window_stride_raw", None)
         sample["camera_names"] = np.asarray(args.camera_names, dtype=object)
 
         for i, cam in enumerate(args.camera_names):
@@ -1115,6 +1149,17 @@ def export_clip_from_args(args: argparse.Namespace) -> dict[str, object]:
             sample["initial_depth_per_cam"][prefix] = payload["initial_depth"]
             sample["intrinsic_per_cam"][prefix] = payload["intrinsic"]
             sample["extrinsic_per_cam"][prefix] = payload["extrinsic"]
+
+        workspace_bounds = getattr(args, "workspace_bounds", None)
+        if workspace_bounds is not None:
+            crop_scene_to_workspace(sample, workspace_bounds)
+            print(
+                "workspace crop (t0 world frame): "
+                f"bounds={sample['workspace_bounds'].tolist()} "
+                f"points={sample['workspace_points_before_per_cam'].tolist()} -> "
+                f"{sample['workspace_points_after_per_cam'].tolist()}",
+                file=sys.stderr,
+            )
 
         # ----------------------------------------------------------------
         # Gripper mesh point flow (Panda hand + two fingers).
@@ -1165,11 +1210,17 @@ def export_clip_from_args(args: argparse.Namespace) -> dict[str, object]:
     return {
         "output": str(out_path),
         "start_idx": int(args.start_idx),
-        "end_idx": int(args.start_idx + T_FRAMES - 1),
+        "end_idx": int(last_raw_idx),
+        "frame_step": int(frame_step),
+        "model_step_seconds": float(sample["model_step_seconds"]),
         "camera_names": [str(name) for name in args.camera_names],
         "robot_points": int(robot_flows.shape[1]),
         "trajectory_source": trajectory_source,
         "camera_layout": camera_layout,
+        "workspace_bounds": (
+            sample["workspace_bounds"].tolist()
+            if sample.get("workspace_bounds") is not None else None
+        ),
     }
 
 

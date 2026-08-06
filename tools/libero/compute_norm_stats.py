@@ -86,8 +86,8 @@ from tools.libero.sample_schema import (  # noqa: E402
 @dataclass
 class _StatsArgs:
     deterministic_train: bool = True
-    grid_size: float = 0.1
-    max_scene_points: int = 10000
+    grid_size: float = 0.015
+    max_scene_points: int = 12000
     seed: int = 0
     robot_features: List[str] = field(default_factory=lambda: [
         "robot_flows", "robot_colors", "robot_normals",
@@ -141,8 +141,12 @@ def _parse_args() -> argparse.Namespace:
                    help="Output JSON path.")
     p.add_argument("--domain", default="libero",
                    help="Domain name to record in the JSON (default: libero).")
-    p.add_argument("--num_cameras", type=int, default=2,
-                   help="Number of cameras to use (default: 2).")
+    p.add_argument("--num_cameras", type=int, default=3,
+                   help="Number of cameras to use (default: 3).")
+    p.add_argument("--grid_size", type=float, default=0.015,
+                   help="Voxel size used by training (default: 0.015).")
+    p.add_argument("--max_scene_points", type=int, default=12000,
+                   help="Training scene-point cap (default: 12000).")
     p.add_argument("--max_files", type=int, default=0,
                    help="If > 0, only process the first N .npz files (smoke test).")
     return p.parse_args()
@@ -160,7 +164,16 @@ def main() -> None:
     if not files:
         raise RuntimeError(f"No .npz files found under {data_dir}")
 
-    pipeline_args = _StatsArgs()
+    if args.num_cameras < 1:
+        raise ValueError("--num_cameras must be >= 1")
+    if args.grid_size <= 0:
+        raise ValueError("--grid_size must be > 0")
+    if args.max_scene_points < 1:
+        raise ValueError("--max_scene_points must be >= 1")
+    pipeline_args = _StatsArgs(
+        grid_size=float(args.grid_size),
+        max_scene_points=int(args.max_scene_points),
+    )
 
     # Streaming accumulators.
     robot_sum = None
@@ -174,7 +187,11 @@ def main() -> None:
     per_t_sq = [np.zeros(3, dtype=np.float64) for _ in range(T_FRAMES)]
     per_t_n = [0] * T_FRAMES
 
-    print(f"[compute_norm_stats] {len(files)} clips from {data_dir}")
+    print(
+        f"[compute_norm_stats] {len(files)} clips from {data_dir} "
+        f"(cameras={args.num_cameras}, grid_size={pipeline_args.grid_size}, "
+        f"max_scene_points={pipeline_args.max_scene_points})"
+    )
     for i, path in enumerate(files):
         try:
             sample = _process_one(path, pipeline_args, num_cameras=args.num_cameras)

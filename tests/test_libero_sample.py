@@ -32,9 +32,12 @@ if str(PROJECT_ROOT) not in sys.path:
 if "dataset_components.utils" not in sys.modules:
     utils_stub = types.ModuleType("dataset_components.utils")
     utils_stub._stable_int_hash = lambda *parts: 0
+    utils_stub._rotate_xy = lambda *parts: None
+    utils_stub.fnv_hash_vec_nb = lambda coords: np.arange(len(coords), dtype=np.uint64)
     sys.modules["dataset_components.utils"] = utils_stub
 
 from dataset_components.cameras import select_cameras_in_order
+from dataset_components.transforms import sphere_crop_transform
 from tools.libero import sample_schema
 from tools.libero.scene_geometry import (
     backproject_depth,
@@ -233,6 +236,9 @@ def test_save_load_roundtrip(synth_clip):
     assert sample["robot_flows"].shape == (sample_schema.T_FRAMES, 16, 3)
     assert sample["right_gripper_pose"].shape == (sample_schema.T_FRAMES, 7)
     assert sample["right_gripper_open"].shape == (sample_schema.T_FRAMES, 1)
+    assert sample["source_control_freq_hz"] == pytest.approx(20.0)
+    assert sample["frame_step"] == 2
+    assert sample["model_step_seconds"] == pytest.approx(0.1)
 
 
 def test_moving_body_actually_moves(synth_clip):
@@ -331,3 +337,53 @@ def test_select_cameras_in_order_preserves_export_order() -> None:
     ]
     assert "cam0_initial_rgb" in ordered
     assert "cam1_initial_rgb" in ordered
+
+
+def test_workspace_crop_uses_t0_and_roundtrips(tmp_path) -> None:
+    sample = sample_schema.empty_clip()
+    prefix = "camera_0"
+    flows = np.zeros((sample_schema.T_FRAMES, 3, 3), dtype=np.float32)
+    flows[:] = np.array([[0.0, 0.0, 1.0], [2.0, 0.0, 1.0], [0.5, 0.0, 1.0]])
+    flows[-1, 0, 0] = 5.0  # retained because selection is intentionally t=0 only
+    sample["scene_flows_per_cam"][prefix] = flows
+    sample["scene_colors_per_cam"][prefix] = np.broadcast_to(
+        np.array([[10, 0, 0], [20, 0, 0], [30, 0, 0]], dtype=np.uint8),
+        flows.shape,
+    ).copy()
+    sample["scene_normals_per_cam"][prefix] = np.zeros_like(flows)
+    mask = np.ones((sample_schema.T_FRAMES, 3), dtype=bool)
+    sample["scene_visibility_per_cam"][prefix] = mask.copy()
+    sample["scene_depth_valid_mask_per_cam"][prefix] = mask.copy()
+    sample["initial_rgb_per_cam"][prefix] = np.zeros(
+        (sample_schema.H_RELEASE, sample_schema.W_RELEASE, 3), dtype=np.uint8
+    )
+    sample["initial_depth_per_cam"][prefix] = np.ones(
+        (sample_schema.H_RELEASE, sample_schema.W_RELEASE), dtype=np.float32
+    )
+    sample["intrinsic_per_cam"][prefix] = np.eye(3, dtype=np.float32)
+    sample["extrinsic_per_cam"][prefix] = np.eye(4, dtype=np.float32)
+
+    bounds = (-1.0, -1.0, 0.0, 1.0, 1.0, 2.0)
+    sample_schema.crop_scene_to_workspace(sample, bounds)
+    assert sample["scene_flows_per_cam"][prefix].shape == (sample_schema.T_FRAMES, 2, 3)
+    assert sample["scene_flows_per_cam"][prefix][-1, 0, 0] == 5.0
+    assert sample["scene_colors_per_cam"][prefix][0, :, 0].tolist() == [10, 30]
+    assert sample["workspace_points_before_per_cam"].tolist() == [3]
+    assert sample["workspace_points_after_per_cam"].tolist() == [2]
+
+    output = tmp_path / "workspace_crop.npz"
+    sample_schema.save_npz(sample, str(output))
+    loaded = sample_schema.load_npz(str(output))
+    assert np.allclose(loaded["workspace_bounds"], np.asarray(bounds).reshape(2, 3))
+    assert loaded["workspace_crop_reference"] == "t0_world_frame"
+
+
+def test_workspace_metadata_skips_redundant_sphere_crop() -> None:
+    flows = np.random.RandomState(0).randn(2, 32, 3).astype(np.float32)
+    sample = {
+        "workspace_bounds": np.array([[-0.8, -0.8, 0.65], [0.8, 0.8, 1.5]], dtype=np.float32),
+        "scene_flows": flows.copy(),
+    }
+    result = sphere_crop_transform(sample, prob=1.0, max_scene_points=1)
+    assert np.array_equal(result["scene_flows"], flows)
+    assert result["__sphere_crop_skipped_workspace__"] is True

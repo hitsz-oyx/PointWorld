@@ -51,6 +51,17 @@ DATA_CONTRACT_KEYS = (
     "domains",
 )
 
+# These affect how a dataset sample is assembled, but do not change model
+# parameter shapes. A new-domain fine-tune may therefore choose them freely;
+# strict checkpoint resume still validates and restores them.
+FINETUNE_DATA_PIPELINE_KEYS = (
+    "norm_stats_path",
+    "train_min_num_cameras",
+    "train_max_num_cameras",
+    "eval_min_num_cameras",
+    "eval_max_num_cameras",
+)
+
 def _cast_optional_int(value: Any) -> int | None:
     if value is None:
         return None
@@ -232,12 +243,10 @@ def apply_model_contract_to_args(
 ) -> list[str]:
     """Apply the checkpoint's model contract to ``args`` in-place.
 
-    When ``skip_data_contract`` is True, also skip the fields listed
-    in :data:`DATA_CONTRACT_KEYS` (``domains``) so that the new run
-    uses its own ``--domains`` / ``--norm_stats_path`` rather than
-    inheriting the source checkpoint's data contract.  This is the
-    correct behaviour for fine-tuning a pre-trained model on a new
-    dataset.
+    When ``skip_data_contract`` is True, keep new-domain dataset fields
+    (normalization and camera-count policy) from the CLI rather than
+    inheriting them from the source checkpoint. This is the correct
+    behaviour for fine-tuning a pre-trained model on a new dataset.
     """
     validated_contract = _validate_model_contract(model_contract, context)
     if explicit_cli_dests is None:
@@ -245,11 +254,11 @@ def apply_model_contract_to_args(
     # Fields that should always follow the CLI rather than the source
     # checkpoint when we are fine-tuning on a new dataset. ``domains`` is
     # already covered by ``DATA_CONTRACT_KEYS``; we additionally skip
-    # ``norm_stats_path`` so a fine-tune run can use a fresh stats folder
-    # without triggering a CLI-vs-checkpoint mismatch.
+    # normalization/camera settings so a fine-tune run can use its target
+    # dataset without triggering a CLI-vs-checkpoint mismatch.
     finetune_skip_keys: set[str] = set()
     if skip_data_contract:
-        finetune_skip_keys.add("norm_stats_path")
+        finetune_skip_keys.update(FINETUNE_DATA_PIPELINE_KEYS)
     changed: list[str] = []
     for key, target_value in validated_contract.items():
         if skip_data_contract and key in DATA_CONTRACT_KEYS:

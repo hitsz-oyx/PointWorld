@@ -119,6 +119,29 @@ def parse_args(skip_command_line=False):
                         help='Allow optimizer reset if checkpoint optimizer state is incompatible')
     parser.add_argument('--grad_clip_max_norm', '-gcmn', type=float, default=5.0)
     parser.add_argument('--data_dirs', '-dd', type=str, default=None, help='comma separated list of data directories')
+    parser.add_argument(
+        '--libero_data_dir_train', type=str, default=None,
+        help=(
+            "LIBERO NPZ training split directory. Prefer passing a root via "
+            "--data_dirs and storing clips under <root>/train; this option is "
+            "available when the splits live in unrelated directories."
+        ),
+    )
+    parser.add_argument(
+        '--libero_data_dir_val', type=str, default=None,
+        help=(
+            "LIBERO NPZ validation split directory. The trainer's internal "
+            "'test' mode reads this directory."
+        ),
+    )
+    parser.add_argument(
+        '--libero_require_temporal_metadata', type=str, default='true',
+        help=(
+            "Require LIBERO NPZ clips to declare a 0.1-second model timestep. "
+            "Disable only for legacy pipeline smoke tests; old consecutive-frame "
+            "clips do not match the PointWorld checkpoint's temporal semantics."
+        ),
+    )
     parser.add_argument('--max_train_steps', type=int, default=-1, help='Stop training after this many train steps (<=0 disables)')
     parser.add_argument(
         '--train_splits',

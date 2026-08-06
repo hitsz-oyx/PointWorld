@@ -27,6 +27,24 @@ def test_plan_trajectory_windows_covers_tail() -> None:
         (140, 150),
         (144, 154),
     ]
+    assert all(w.frame_step == 1 for w in windows)
+
+
+def test_plan_trajectory_windows_uses_raw_indices_for_frame_step_two() -> None:
+    windows = plan_trajectory_windows(
+        start_idx=0,
+        end_idx=40,
+        window_size=11,
+        stride=5,
+        frame_step=2,
+    )
+    assert [(w.start_idx, w.end_idx) for w in windows] == [
+        (0, 20),
+        (10, 30),
+        (20, 40),
+    ]
+    assert all(w.frame_step == 2 for w in windows)
+    assert list(build_trajectory_frame_map(windows)) == list(range(0, 41, 2))
 
 
 def test_newly_covered_indices_emit_each_global_frame_once() -> None:

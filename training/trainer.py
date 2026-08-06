@@ -38,6 +38,17 @@ from pointworld.base import BaseModel
 from pointworld.checkpoint_contract import apply_model_contract_to_args, read_checkpoint_contract
 from training import checkpointing as checkpointing_utils
 
+
+def _next_or_restart(dataloader, data_iter):
+    """Return the next batch, recreating an exhausted persistent iterator."""
+    try:
+        batch = next(data_iter)
+    except StopIteration:
+        data_iter = iter(dataloader)
+        batch = next(data_iter)
+    return batch, data_iter
+
+
 class Trainer:
     def __init__(self, args, inference_only=False, data_info_dict=None):
         self.args = args
@@ -323,8 +334,10 @@ class Trainer:
         # Store total samples for epoch estimation
         self.train_total_samples = train_info['total_samples']
 
-        # persistent iterator for *train inference* evaluation
+        # Training and train-set evaluation must not share an iterator: an
+        # evaluation pass can exhaust it before the optimizer sees a batch.
         self.train_iter = iter(self.train_dataloader)
+        self.train_eval_iter = iter(self.train_dataloader)
         return data_info_dict
 
     def _save_checkpoint_now(self, adjusted_batch_count, log_dict=None):
@@ -360,12 +373,7 @@ class Trainer:
                   leave=False,
                   disable=self.rank != 0) as tbar:
             for _ in tbar:
-                try:
-                    batch = next(data_iter)
-                except StopIteration:
-                    # Exhausted: recreate iterator and continue without interrupting training
-                    data_iter = iter(dataloader)
-                    batch = next(data_iter)
+                batch, data_iter = _next_or_restart(dataloader, data_iter)
 
                 batch = {k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v
                          for k, v in batch.items()}
@@ -429,10 +437,11 @@ class Trainer:
                               desc=f'Initializing...',  # Will be updated in the loop
                               leave=False)
 
-            # Iterate through one epoch using the shared train_iter
+            # Iterate through one epoch using the optimizer-only iterator.
             for train_batch_idx in range(len(self.train_dataloader)):
-                # Get next batch from shared iterator
-                train_batch = next(self.train_iter)
+                train_batch, self.train_iter = _next_or_restart(
+                    self.train_dataloader, self.train_iter
+                )
                 log_dict = dict()
 
                 # Calculate adjusted batch count for frequency checks (equivalent to elapsed time)
@@ -445,9 +454,9 @@ class Trainer:
                     if self.args.distributed:
                         dist.barrier()
                     # eval on train set
-                    log_dict, self.train_iter = self.eval_step(
+                    log_dict, self.train_eval_iter = self.eval_step(
                         self.train_dataloader,
-                        self.train_iter,
+                        self.train_eval_iter,
                         prefix='train_eval',
                         log_dict=log_dict
                     )

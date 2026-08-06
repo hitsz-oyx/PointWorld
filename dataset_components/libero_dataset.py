@@ -54,6 +54,43 @@ from dataset_components.robot import canonicalize_gripper_keys_and_flags
 from tools.libero.sample_schema import flatten_for_pointworld, load_npz
 
 
+POINTWORLD_STEP_SECONDS = 0.1
+
+
+def validate_temporal_metadata(sample: dict, path: Path) -> None:
+    required = (
+        "source_control_freq_hz",
+        "frame_step",
+        "model_step_seconds",
+    )
+    missing = [key for key in required if sample.get(key) is None]
+    if missing:
+        raise ValueError(
+            f"LIBERO clip {path} lacks temporal metadata {missing}. This is "
+            "usually a legacy 20 Hz consecutive-frame export covering only "
+            "0.5 seconds; re-export it with --frame_step 2."
+        )
+    control_hz = float(sample["source_control_freq_hz"])
+    frame_step = int(sample["frame_step"])
+    model_dt = float(sample["model_step_seconds"])
+    if control_hz <= 0 or frame_step < 1:
+        raise ValueError(
+            f"Invalid temporal metadata in {path}: control_hz={control_hz}, "
+            f"frame_step={frame_step}."
+        )
+    derived_dt = frame_step / control_hz
+    if not np.isclose(model_dt, derived_dt, atol=1e-6):
+        raise ValueError(
+            f"Inconsistent temporal metadata in {path}: model_step_seconds={model_dt} "
+            f"but frame_step/control_hz={derived_dt}."
+        )
+    if not np.isclose(model_dt, POINTWORLD_STEP_SECONDS, atol=1e-6):
+        raise ValueError(
+            f"LIBERO clip {path} uses {model_dt}s per model step; PointWorld "
+            f"requires {POINTWORLD_STEP_SECONDS}s."
+        )
+
+
 class LiberoNPZDataset(Dataset):
     """Map-style ``Dataset`` over a directory of LIBERO ``.npz`` clips.
 
@@ -122,10 +159,12 @@ class LiberoNPZDataset(Dataset):
         # much faster to inline ``np.load(..., allow_pickle=True)``
         # here and skip the round-trip.
         raw = load_npz(str(path))
+        if getattr(self.args, "libero_require_temporal_metadata", True):
+            validate_temporal_metadata(raw, path)
         sample = flatten_for_pointworld(raw)
         sample["__domain__"] = self.domain
         sample["__key__"] = path.stem
         return self._process_sample(sample)
 
 
-__all__ = ["LiberoNPZDataset"]
+__all__ = ["LiberoNPZDataset", "validate_temporal_metadata"]

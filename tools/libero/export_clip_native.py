@@ -139,6 +139,7 @@ H_RELEASE = sample_schema.H_RELEASE
 W_RELEASE = sample_schema.W_RELEASE
 empty_clip = sample_schema.empty_clip
 save_npz = sample_schema.save_npz
+crop_scene_to_workspace = sample_schema.crop_scene_to_workspace
 
 
 # ---------------------------------------------------------------------------
@@ -239,8 +240,14 @@ def capture_frame_native(
 # Environment construction (BDDL + camera layout, no EGL context).
 # ---------------------------------------------------------------------------
 
-def _build_env_native(bddl: str, camera_names, height: int, width: int,
-                       camera_layout: str):
+def _build_env_native(
+    bddl: str,
+    camera_names,
+    height: int,
+    width: int,
+    camera_layout: str,
+    model_xml: str | None = None,
+):
     """Build a ``ControlEnv`` with the offscreen renderer disabled and
     apply the requested camera layout. Returns ``(env, sim, model, data)``.
 
@@ -257,6 +264,14 @@ def _build_env_native(bddl: str, camera_names, height: int, width: int,
         has_renderer=False,
         use_camera_obs=False,
     )
+    if model_xml is not None:
+        # LIBERO stores the exact MuJoCo XML used to record each demo. It
+        # includes model-level fixture poses that are not represented in the
+        # flattened qpos/qvel state, so loading it is required for faithful
+        # and deterministic reconstruction.
+        env.reset()
+        env.reset_from_xml_string(model_xml)
+        env.sim.reset()
     # The native renderer doesn't use robosuite's camera-resolution
     # knobs (which are baked into the env's offscreen-renderer width
     # and height attributes), but the LIBERO BDDL env's *intrinsic
@@ -279,154 +294,184 @@ def _build_env_native(bddl: str, camera_names, height: int, width: int,
 # Main export function.
 # ---------------------------------------------------------------------------
 
-def export_clip_native(args: argparse.Namespace) -> dict:
-    """Export a single 11-frame LIBERO clip via the native mujoco
-    renderer + OSMesa path. Returns a small status dict."""
-    t_start = time.time()
-    camera_names = list(args.camera_names)
-    camera_layout = str(args.camera_layout)
-    height = int(args.camera_height)
-    width = int(args.camera_width)
+class NativeDemoExporter:
+    """Reusable native renderer for all windows from one LIBERO demo."""
 
-    # ------------------------------------------------------------------
-    # 1) Read HDF5 (states + actions).
-    # ------------------------------------------------------------------
-    with h5py.File(args.demo_hdf5, "r") as f:
-        if args.demo_id not in f["data"]:
-            raise KeyError(
-                f"Demo group {args.demo_id!r} not found in {args.demo_hdf5}. "
-                f"Available: {list(f['data'].keys())[:5]}..."
-            )
-        demo_group = f[f"data/{args.demo_id}"]
-        states = np.asarray(demo_group["states"], dtype=np.float32)
-        actions = np.asarray(demo_group["actions"], dtype=np.float32)
-        if args.start_idx < 0 or args.start_idx + (T_FRAMES - 1) >= len(actions):
-            raise ValueError(
-                f"start_idx={args.start_idx} out of range for demo with "
-                f"{len(actions)} actions (need at least {T_FRAMES - 1} steps left)."
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.camera_names = list(args.camera_names)
+        self.camera_layout = str(args.camera_layout)
+        self.height = int(args.camera_height)
+        self.width = int(args.camera_width)
+
+        with h5py.File(args.demo_hdf5, "r") as f:
+            if args.demo_id not in f["data"]:
+                raise KeyError(
+                    f"Demo group {args.demo_id!r} not found in {args.demo_hdf5}. "
+                    f"Available: {list(f['data'].keys())[:5]}..."
+                )
+            demo_group = f[f"data/{args.demo_id}"]
+            self.states = np.asarray(demo_group["states"], dtype=np.float32)
+            if "model_file" in demo_group.attrs:
+                model_file = demo_group.attrs["model_file"]
+            elif "model_file" in demo_group:
+                model_file = demo_group["model_file"][()]
+            else:
+                model_file = None
+            if isinstance(model_file, bytes):
+                model_file = model_file.decode("utf-8")
+            if model_file is None:
+                if not getattr(args, "allow_bddl_reconstruction", False):
+                    raise ValueError(
+                        f"Demo group {args.demo_id!r} in {args.demo_hdf5} has no "
+                        "model_file. A flattened LIBERO state cannot restore "
+                        "model-level fixture poses. Use the official HDF5 with "
+                        "embedded model_file, or explicitly pass "
+                        "--allow_bddl_reconstruction for a non-faithful preview."
+                    )
+                model_xml = None
+                self.model_source = "bddl_reconstruction"
+            else:
+                model_xml = _exp.libero_env_utils.postprocess_model_xml(
+                    str(model_file), {}
+                )
+                model_xml = _exp._rewrite_libero_asset_paths(model_xml)
+                self.model_source = "embedded_model_file"
+            bddl = _exp._resolve_bddl_for_demo(
+                demo_hdf5=args.demo_hdf5,
+                f=f,
+                demo_group=demo_group,
+                cli_bddl=args.bddl,
+                extra_search_dirs=args.bddl_search_dir,
             )
 
-        # Resolve the BDDL the same way the original export does.
-        # We close the HDF5 handle in the finally below; the
-        # ``_resolve_bddl_for_demo`` helper accepts the open file.
-        bddl = _exp._resolve_bddl_for_demo(
-            demo_hdf5=args.demo_hdf5,
-            f=f,
-            demo_group=demo_group,
-            cli_bddl=args.bddl,
-            extra_search_dirs=args.bddl_search_dir,
+        self.env, self.sim, self.model, self.data = _build_env_native(
+            bddl=bddl,
+            camera_names=self.camera_names,
+            height=self.height,
+            width=self.width,
+            camera_layout=self.camera_layout,
+            model_xml=model_xml,
         )
-
-    # ------------------------------------------------------------------
-    # 2) Build env (no EGL, no camera obs) + native mujoco.Renderer.
-    # ------------------------------------------------------------------
-    env, sim, model, data = _build_env_native(
-        bddl=bddl,
-        camera_names=camera_names,
-        height=height,
-        width=width,
-        camera_layout=camera_layout,
-    )
-    renderer = mujoco.Renderer(model, height=height, width=width)
-    try:
-        # --------------------------------------------------------------
-        # 3) Identify bodies: scene vs robot.
-        # --------------------------------------------------------------
-        robot_body_set = set(list_robot_body_names(env))
-        gripper_body_names = get_gripper_body_names(env)
-        all_body_names = []
-        for i in range(model.nbody):
-            name = model.body(i).name
+        self.renderer = mujoco.Renderer(
+            self.model, height=self.height, width=self.width
+        )
+        self.robot_body_set = set(list_robot_body_names(self.env))
+        self.gripper_body_names = get_gripper_body_names(self.env)
+        self.all_body_names = []
+        for i in range(self.model.nbody):
+            name = self.model.body(i).name
             if isinstance(name, bytes):
                 name = name.decode("utf-8", errors="ignore")
             if name:
-                all_body_names.append(name)
-        body_poses_per_t: dict = {}
+                self.all_body_names.append(name)
 
-        # --------------------------------------------------------------
-        # 4) Frame 0 (context).
-        # --------------------------------------------------------------
-        _set_state_from_flattened(env, model, data, states[args.start_idx])
-        per_cam0, gpose0, gopen0 = capture_frame_native(
-            renderer, model, data, env, camera_names, height, width,
+    def close(self) -> None:
+        try:
+            self.renderer.close()
+        finally:
+            self.env.close()
+
+    def export(self, args: argparse.Namespace) -> dict:
+        t_start = time.time()
+        frame_step = int(
+            getattr(args, "frame_step", sample_schema.DEFAULT_FRAME_STEP)
         )
-        depth_per_t: dict = {
-            c: [per_cam0[c][1]] for c in camera_names
-        }
-        rgb0_per_cam = {c: per_cam0[c][0] for c in camera_names}
-        seg0_per_cam = {c: per_cam0[c][2] for c in camera_names}
+        if frame_step < 1:
+            raise ValueError(f"frame_step must be >= 1, got {frame_step}")
+        last_raw_idx = int(args.start_idx) + (T_FRAMES - 1) * frame_step
+        if args.start_idx < 0 or last_raw_idx >= len(self.states):
+            raise ValueError(
+                f"start_idx={args.start_idx} out of range for demo with "
+                f"{len(self.states)} states (frame_step={frame_step} requires "
+                f"last raw index {last_raw_idx})."
+            )
+
+        body_poses_per_t: dict = {}
+        _set_state_from_flattened(
+            self.env, self.model, self.data, self.states[args.start_idx]
+        )
+        per_cam0, gpose0, gopen0 = capture_frame_native(
+            self.renderer, self.model, self.data, self.env,
+            self.camera_names, self.height, self.width,
+        )
+        depth_per_t = {c: [per_cam0[c][1]] for c in self.camera_names}
+        rgb0_per_cam = {c: per_cam0[c][0] for c in self.camera_names}
+        seg0_per_cam = {c: per_cam0[c][2] for c in self.camera_names}
         body_name0_per_cam = {}
         K_t0_per_cam = {}
         T_c_w_t0_per_cam = {}
         T_w_c_t0_per_cam = {}
-        for c in camera_names:
-            _, body_name = get_per_pixel_bodies(env, seg0_per_cam[c])
-            body_name0_per_cam[c] = body_name
-            K_t0_per_cam[c] = get_camera_intrinsic(env, c, height, width)
-            T_w_c_t0_per_cam[c] = get_camera_extrinsic_w_c(env, c)
-            T_c_w_t0_per_cam[c] = get_camera_extrinsic_c_w(env, c)
+        for camera in self.camera_names:
+            _, body_name = get_per_pixel_bodies(self.env, seg0_per_cam[camera])
+            body_name0_per_cam[camera] = body_name
+            K_t0_per_cam[camera] = get_camera_intrinsic(
+                self.env, camera, self.height, self.width
+            )
+            T_w_c_t0_per_cam[camera] = get_camera_extrinsic_w_c(self.env, camera)
+            T_c_w_t0_per_cam[camera] = get_camera_extrinsic_c_w(self.env, camera)
         gripper_poses = [gpose0]
         gripper_opens = [gopen0]
-        snapshot_body_poses(env, all_body_names, 0, body_poses_per_t)
+        snapshot_body_poses(self.env, self.all_body_names, 0, body_poses_per_t)
 
-        # --------------------------------------------------------------
-        # 5) Frames 1..T_FRAMES-1 (set state from HDF5 recording).
-        # --------------------------------------------------------------
         for k in range(T_FRAMES - 1):
-            target_state = states[args.start_idx + k + 1]
-            _set_state_from_flattened(env, model, data, target_state)
-            per_cam, gpose, gopen = capture_frame_native(
-                renderer, model, data, env, camera_names, height, width,
+            raw_idx = int(args.start_idx) + (k + 1) * frame_step
+            _set_state_from_flattened(
+                self.env, self.model, self.data, self.states[raw_idx]
             )
-            for c in camera_names:
-                depth_per_t[c].append(per_cam[c][1])
+            per_cam, gpose, gopen = capture_frame_native(
+                self.renderer, self.model, self.data, self.env,
+                self.camera_names, self.height, self.width,
+            )
+            for camera in self.camera_names:
+                depth_per_t[camera].append(per_cam[camera][1])
             gripper_poses.append(gpose)
             gripper_opens.append(gopen)
-            snapshot_body_poses(env, all_body_names, k + 1, body_poses_per_t)
-        print(
-            "trajectory source: recorded HDF5 states (native mujoco renderer)",
-            file=sys.stderr,
-        )
+            snapshot_body_poses(
+                self.env, self.all_body_names, k + 1, body_poses_per_t
+            )
 
-        # --------------------------------------------------------------
-        # 6) Build the in-memory sample (reuse the same builder).
-        # --------------------------------------------------------------
         sample = empty_clip()
         sample["__key__"] = (
-            f"{args.demo_id}-{args.start_idx}:{args.start_idx + T_FRAMES - 1}"
+            f"{args.demo_id}-{args.start_idx}:{last_raw_idx}:step{frame_step}"
         )
-        sample["camera_names"] = np.asarray(camera_names, dtype=object)
+        sample["source_control_freq_hz"] = float(
+            getattr(args, "source_control_freq_hz", sample_schema.DEFAULT_CONTROL_FREQ_HZ)
+        )
+        sample["frame_step"] = frame_step
+        sample["model_step_seconds"] = frame_step / sample["source_control_freq_hz"]
+        sample["window_stride_raw"] = getattr(args, "window_stride_raw", None)
+        sample["camera_names"] = np.asarray(self.camera_names, dtype=object)
 
-        for i, cam in enumerate(camera_names):
+        for i, camera in enumerate(self.camera_names):
             prefix = f"camera_{i}"
             payload = _exp.build_scene_trajectory(
-                env, cam, depth_per_t[cam], body_name0_per_cam[cam],
-                robot_body_set, body_poses_per_t,
-                K_t0=K_t0_per_cam[cam],
-                T_c_w_t0=T_c_w_t0_per_cam[cam],
-                T_w_c_t0=T_w_c_t0_per_cam[cam],
-                rgb_t0=rgb0_per_cam[cam],
+                self.env, camera, depth_per_t[camera], body_name0_per_cam[camera],
+                self.robot_body_set, body_poses_per_t,
+                K_t0=K_t0_per_cam[camera],
+                T_c_w_t0=T_c_w_t0_per_cam[camera],
+                T_w_c_t0=T_w_c_t0_per_cam[camera],
+                rgb_t0=rgb0_per_cam[camera],
             )
-            sample["scene_flows_per_cam"][prefix] = payload["scene_flows"]
-            sample["scene_colors_per_cam"][prefix] = payload["scene_colors"]
-            sample["scene_normals_per_cam"][prefix] = payload["scene_normals"]
-            sample["scene_visibility_per_cam"][prefix] = payload["scene_visibility"]
-            sample["scene_depth_valid_mask_per_cam"][prefix] = payload["scene_depth_valid_mask"]
+            for field in (
+                "scene_flows", "scene_colors", "scene_normals",
+                "scene_visibility", "scene_depth_valid_mask",
+            ):
+                sample[f"{field}_per_cam"][prefix] = payload[field]
             sample["initial_rgb_per_cam"][prefix] = payload["initial_rgb"]
             sample["initial_depth_per_cam"][prefix] = payload["initial_depth"]
             sample["intrinsic_per_cam"][prefix] = payload["intrinsic"]
             sample["extrinsic_per_cam"][prefix] = payload["extrinsic"]
 
-        if gripper_body_names:
+        if getattr(args, "workspace_bounds", None) is not None:
+            crop_scene_to_workspace(sample, args.workspace_bounds)
+
+        if self.gripper_body_names:
             robot_flows, robot_normals, robot_colors = _exp.build_robot_trajectory(
-                env, gripper_body_names, body_poses_per_t,
+                self.env, self.gripper_body_names, body_poses_per_t,
                 n_per_body=args.robot_points_per_body,
             )
         else:
-            print(
-                "WARNING: no gripper bodies found; emitting empty robot_flows",
-                file=sys.stderr,
-            )
             robot_flows = np.zeros((T_FRAMES, 0, 3), dtype=np.float32)
             robot_normals = np.zeros((T_FRAMES, 0, 3), dtype=np.float32)
             robot_colors = np.zeros((T_FRAMES, 0, 3), dtype=np.uint8)
@@ -434,42 +479,47 @@ def export_clip_native(args: argparse.Namespace) -> dict:
         sample["robot_normals"] = robot_normals
         sample["robot_colors"] = robot_colors
         sample["right_gripper_pose"] = np.stack(gripper_poses, axis=0)
-        sample["right_gripper_open"] = np.array(
-            gripper_opens, dtype=np.float32,
+        sample["right_gripper_open"] = np.asarray(
+            gripper_opens, dtype=np.float32
         ).reshape(T_FRAMES, 1)
-    finally:
-        try:
-            renderer.close()
-        except Exception:
-            pass
-        try:
-            env.close()
-        except Exception:
-            pass
 
-    # ------------------------------------------------------------------
-    # 7) Save.
-    # ------------------------------------------------------------------
-    out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    save_npz(sample, str(out_path))
-    elapsed = time.time() - t_start
+        out_path = Path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        save_npz(sample, str(out_path))
+        elapsed = time.time() - t_start
+        return {
+            "out_path": str(out_path),
+            "robot_points": int(robot_flows.shape[1]),
+            "scene_points_per_cam": {
+                key: int(value.shape[1])
+                for key, value in sample["scene_flows_per_cam"].items()
+            },
+            "elapsed_s": elapsed,
+            "workspace_bounds": (
+                sample["workspace_bounds"].tolist()
+                if sample.get("workspace_bounds") is not None else None
+            ),
+            "start_idx": int(args.start_idx),
+            "end_idx": int(last_raw_idx),
+            "frame_step": int(frame_step),
+            "model_step_seconds": float(sample["model_step_seconds"]),
+            "model_source": self.model_source,
+        }
+
+
+def export_clip_native(args: argparse.Namespace) -> dict:
+    """Export one clip, using the same reusable runtime as bulk export."""
+    exporter = NativeDemoExporter(args)
+    try:
+        result = exporter.export(args)
+    finally:
+        exporter.close()
     print(
-        f"Saved {out_path}  "
-        f"(T={T_FRAMES}, robot_points={robot_flows.shape[1]}, "
-        f"scene_points_per_cam="
-        f"{[sample['scene_flows_per_cam'][k].shape[1] for k in sample['scene_flows_per_cam']]}, "
-        f"elapsed={elapsed:.1f}s)",
+        f"Saved {result['out_path']} (start={result['start_idx']}, "
+        f"end={result['end_idx']}, elapsed={result['elapsed_s']:.1f}s)",
         file=sys.stderr,
     )
-    return {
-        "out_path": str(out_path),
-        "robot_points": int(robot_flows.shape[1]),
-        "scene_points_per_cam": {
-            k: int(v.shape[1]) for k, v in sample["scene_flows_per_cam"].items()
-        },
-        "elapsed_s": elapsed,
-    }
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +546,14 @@ def _parse_args() -> argparse.Namespace:
                    help="Demo group name inside the HDF5 (default: demo_0).")
     p.add_argument("--start_idx", type=int, required=True,
                    help="Index in the demo to use as the context frame.")
+    p.add_argument(
+        "--frame_step", type=int, default=sample_schema.DEFAULT_FRAME_STEP,
+        help="Raw 20 Hz LIBERO states per 0.1 s PointWorld step (default: 2).",
+    )
+    p.add_argument(
+        "--window_stride_raw", type=int, default=None,
+        help="Optional raw-index window stride recorded as NPZ metadata.",
+    )
     p.add_argument("--bddl", default=None,
                    help=(
                        "Path to the BDDL file for this task. If omitted, the "
@@ -518,6 +576,24 @@ def _parse_args() -> argparse.Namespace:
                    help="MuJoCo body name for the gripper EEF.")
     p.add_argument("--robot_points_per_body", type=int, default=64,
                    help="Mesh vertices to sample per gripper sub-body.")
+    p.add_argument(
+        "--allow_bddl_reconstruction",
+        action="store_true",
+        help=(
+            "Allow demos without embedded model_file by rebuilding from BDDL. "
+            "This cannot restore recorded fixture poses and is only suitable "
+            "for non-faithful previews."
+        ),
+    )
+    p.add_argument(
+        "--workspace_bounds", nargs=6, type=float, default=None,
+        metavar=("XMIN", "YMIN", "ZMIN", "XMAX", "YMAX", "ZMAX"),
+        help=(
+            "Optional frame-0 LIBERO world-frame crop. Recommended tabletop "
+            "bounds: "
+            f"{' '.join(str(v) for v in sample_schema.DEFAULT_WORKSPACE_BOUNDS)}."
+        ),
+    )
     p.add_argument("--output", "-o", required=True, help="Output .npz path.")
     return p.parse_args()
 

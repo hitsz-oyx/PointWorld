@@ -44,8 +44,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--window_stride",
         type=int,
-        default=T_FRAMES - 1,
-        help="Window-start stride; default 10 retains each 10-step prediction.",
+        default=5,
+        help="Window-start stride in PointWorld steps (default 5 = 0.5 s).",
+    )
+    p.add_argument(
+        "--frame_step", type=int, default=2,
+        help="Raw LIBERO states per PointWorld step (default 2 at 20 Hz).",
     )
     p.add_argument("--output_dir", required=True)
     p.add_argument("--bddl", default=None)
@@ -64,6 +68,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--camera_width", type=int, default=W_RELEASE)
     p.add_argument("--gripper_eef_body", default="gripper0_eef")
     p.add_argument("--robot_points_per_body", type=int, default=64)
+    p.add_argument(
+        "--workspace_bounds", nargs=6, type=float, default=None,
+        metavar=("XMIN", "YMIN", "ZMIN", "XMAX", "YMAX", "ZMAX"),
+    )
     p.add_argument(
         "--trajectory_source",
         choices=["recorded", "replay"],
@@ -94,6 +102,7 @@ def main() -> None:
         end_idx=end_idx,
         window_size=T_FRAMES,
         stride=int(args.window_stride),
+        frame_step=int(args.frame_step),
     )
 
     output_dir = Path(args.output_dir)
@@ -106,8 +115,12 @@ def main() -> None:
         "end_idx": end_idx,
         "window_size": T_FRAMES,
         "window_stride": int(args.window_stride),
+        "window_stride_raw": int(args.window_stride) * int(args.frame_step),
+        "frame_step": int(args.frame_step),
+        "model_step_seconds": float(args.frame_step / 20.0),
         "trajectory_source": str(args.trajectory_source),
         "camera_layout": str(args.camera_layout),
+        "workspace_bounds": args.workspace_bounds,
         "windows": [],
     }
 
@@ -134,6 +147,9 @@ def main() -> None:
                 gripper_eef_body=args.gripper_eef_body,
                 robot_points_per_body=args.robot_points_per_body,
                 trajectory_source=args.trajectory_source,
+                workspace_bounds=args.workspace_bounds,
+                frame_step=int(args.frame_step),
+                window_stride_raw=int(args.window_stride) * int(args.frame_step),
                 output=str(output),
             )
             result = export_clip_from_args(export_args)
