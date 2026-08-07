@@ -236,6 +236,31 @@ def capture_frame_native(
     return per_cam, gripper_pose, gripper_open
 
 
+def capture_depth_native(
+    renderer: "mujoco.Renderer",
+    data: "mujoco.MjData",
+    camera_names,
+):
+    """Render only metric depth for trajectory frames after ``t0``.
+
+    RGB and segmentation are only consumed at the context frame. Rendering
+    them for the remaining ten frames used to account for 60 of the 99
+    per-window camera render calls, even though both results were discarded.
+    """
+    depth_per_cam = {}
+    renderer.enable_depth_rendering()
+    try:
+        for cam in camera_names:
+            renderer.update_scene(data, camera=cam)
+            depth = np.asarray(renderer.render(), dtype=np.float32)
+            if depth.ndim == 3 and depth.shape[-1] == 1:
+                depth = depth[..., 0]
+            depth_per_cam[cam] = depth
+    finally:
+        renderer.disable_depth_rendering()
+    return depth_per_cam
+
+
 # ---------------------------------------------------------------------------
 # Environment construction (BDDL + camera layout, no EGL context).
 # ---------------------------------------------------------------------------
@@ -419,12 +444,13 @@ class NativeDemoExporter:
             _set_state_from_flattened(
                 self.env, self.model, self.data, self.states[raw_idx]
             )
-            per_cam, gpose, gopen = capture_frame_native(
-                self.renderer, self.model, self.data, self.env,
-                self.camera_names, self.height, self.width,
+            depth_per_cam = capture_depth_native(
+                self.renderer, self.data, self.camera_names,
             )
+            gpose = get_gripper_pose(self.env)
+            gopen = get_gripper_open(self.env)
             for camera in self.camera_names:
-                depth_per_t[camera].append(per_cam[camera][1])
+                depth_per_t[camera].append(depth_per_cam[camera])
             gripper_poses.append(gpose)
             gripper_opens.append(gopen)
             snapshot_body_poses(

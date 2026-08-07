@@ -8,12 +8,11 @@ per-task / per-demo split is recorded in
 ``manifest.json`` so the training dataloader can later reconstruct the
 train/val assignment.
 
-This is a thin driver around :mod:`tools.libero.export_clip_native` so we
-do not duplicate the BDDL / camera-layout / state-setting logic. We just
-import the entry point and shell out one Python process per clip -- the
-env + mujoco.Renderer construction is dominated by OSMesa + LIBERO BDDL
-imports and does not survive pickling into multiprocessing pools cleanly,
-so per-clip subprocesses are the simplest reliable strategy.
+This is a thin driver around :mod:`tools.libero.export_demo_windows_native` so
+we do not duplicate the BDDL / camera-layout / state-setting logic. Each child
+process owns one complete demo and reuses its environment and renderer for all
+windows. Multiple demo processes can run concurrently via ``--num_workers``;
+only the parent writes ``manifest.json``.
 """
 from __future__ import annotations
 
@@ -25,6 +24,7 @@ import sys
 import tempfile
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import h5py
@@ -188,7 +188,15 @@ def main() -> None:
     ap.add_argument("--libero_root", required=True,
                     help="Root directory containing <task>_demo.hdf5 files.")
     ap.add_argument("--output_root", required=True,
-                    help="Output root; clips are written to <output_root>/<split>/<task_short>__<demo_id>.npz.")
+                    help="Root directory for exported clips and manifest.json.")
+    ap.add_argument(
+        "--output_layout", choices=("split", "pool"), default="split",
+        help=(
+            "Output directory layout. 'split' writes train/val directories "
+            "using --n_val_per_task; 'pool' writes every demo below clips/ "
+            "without assigning a training split (default: split)."
+        ),
+    )
     ap.add_argument("--n_demos_per_task", type=int, default=-1,
                     help="If > 0, only use the first N demos per task (for smoke tests).")
     ap.add_argument("--n_val_per_task", type=int, default=5,
@@ -214,6 +222,10 @@ def main() -> None:
     ap.add_argument(
         "--max_windows_per_demo", type=int, default=0,
         help="If > 0, export at most this many windows per demo (smoke tests).",
+    )
+    ap.add_argument(
+        "--num_workers", type=int, default=1,
+        help="Number of demo subprocesses to export concurrently (default: 1).",
     )
     ap.add_argument("--camera_layout", default="oblique_triplet",
                     choices=("native", "oblique_pair", "oblique_triplet"))
@@ -248,6 +260,8 @@ def main() -> None:
         raise ValueError("--max_windows_per_demo must be >= 0")
     if args.max_demos_per_split < 0:
         raise ValueError("--max_demos_per_split must be >= 0")
+    if args.num_workers < 1:
+        raise ValueError("--num_workers must be >= 1")
     raw_window_stride = int(args.frame_step) * int(args.window_stride)
     raw_window_span = (T_FRAMES - 1) * int(args.frame_step)
 
@@ -264,14 +278,20 @@ def main() -> None:
         demos = _list_demos(hdf5)
         if args.n_demos_per_task > 0:
             demos = demos[: args.n_demos_per_task]
-        n_val = max(0, min(args.n_val_per_task, len(demos)))
-        train_demos = demos[:-n_val] if n_val else demos
-        val_demos = demos[-n_val:] if n_val else []
-        if args.max_demos_per_split > 0:
-            train_demos = train_demos[: args.max_demos_per_split]
-            val_demos = val_demos[: args.max_demos_per_split]
+        if args.output_layout == "pool":
+            if args.max_demos_per_split > 0:
+                demos = demos[: args.max_demos_per_split]
+            demo_groups = (("pool", demos),)
+        else:
+            n_val = max(0, min(args.n_val_per_task, len(demos)))
+            train_demos = demos[:-n_val] if n_val else demos
+            val_demos = demos[-n_val:] if n_val else []
+            if args.max_demos_per_split > 0:
+                train_demos = train_demos[: args.max_demos_per_split]
+                val_demos = val_demos[: args.max_demos_per_split]
+            demo_groups = (("train", train_demos), ("val", val_demos))
         task_short = _short_task_name(hdf5.stem)
-        for split, split_demos in (("train", train_demos), ("val", val_demos)):
+        for split, split_demos in demo_groups:
             for demo_id in split_demos:
                 num_states = _demo_num_states(hdf5, demo_id)
                 last_start = num_states - 1 - raw_window_span
@@ -279,7 +299,8 @@ def main() -> None:
                 if args.max_windows_per_demo > 0:
                     starts = starts[: args.max_windows_per_demo]
                 for start_idx in starts:
-                    out = output_root / split / (
+                    output_dir = output_root / ("clips" if split == "pool" else split)
+                    out = output_dir / (
                         f"{task_short}__{demo_id}__start{start_idx:06d}.npz"
                     )
                     plan.append({
@@ -290,13 +311,20 @@ def main() -> None:
                         "split": split,
                     })
 
-    print(f"[bulk_export] {len(plan)} clips planned "
-          f"(train={sum(1 for p in plan if p['split']=='train')}, "
-          f"val={sum(1 for p in plan if p['split']=='val')})", flush=True)
+    plan_counts = {
+        split: sum(1 for item in plan if item["split"] == split)
+        for split in ("train", "val", "pool")
+        if any(item["split"] == split for item in plan)
+    }
+    print(
+        f"[bulk_export] {len(plan)} clips planned ({plan_counts})",
+        flush=True,
+    )
 
     manifest: dict = {
         "libero_root": str(libero_root),
         "output_root": str(output_root),
+        "output_layout": args.output_layout,
         "camera_layout": args.camera_layout,
         "camera_names": list(args.camera_names),
         "start_idx": int(args.start_idx),
@@ -305,6 +333,7 @@ def main() -> None:
         "window_stride": int(args.window_stride),
         "window_stride_raw": int(raw_window_stride),
         "max_windows_per_demo": int(args.max_windows_per_demo),
+        "num_workers": int(args.num_workers),
         "workspace_bounds": args.workspace_bounds,
         "model_policy": (
             "allow_bddl_reconstruction"
@@ -335,7 +364,7 @@ def main() -> None:
     for item in plan:
         groups[(item["hdf5"], item["demo_id"], item["split"])].append(item)
 
-    t_run = time.time()
+    jobs = []
     n_done = n_skip = n_fail = n_processed = 0
     for group_index, ((hdf5, demo_id, split), items) in enumerate(groups.items(), start=1):
         pending = []
@@ -351,7 +380,21 @@ def main() -> None:
             else:
                 pending.append(item)
         if pending:
-            returncode, results, stderr_tail = _run_demo_windows(
+            jobs.append((group_index, hdf5, demo_id, split, pending))
+
+    print(
+        f"[bulk_export] starting {len(jobs)} demo jobs with "
+        f"num_workers={args.num_workers} (skipped_clips={n_skip})",
+        flush=True,
+    )
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+
+    t_run = time.time()
+    completed_groups = 0
+    with ThreadPoolExecutor(max_workers=args.num_workers) as executor:
+        futures = {
+            executor.submit(
+                _run_demo_windows,
                 hdf5=hdf5,
                 demo_id=demo_id,
                 items=pending,
@@ -362,7 +405,16 @@ def main() -> None:
                 frame_step=int(args.frame_step),
                 window_stride_raw=raw_window_stride,
                 allow_bddl_reconstruction=args.allow_bddl_reconstruction,
-            )
+            ): (group_index, hdf5, demo_id, split, pending)
+            for group_index, hdf5, demo_id, split, pending in jobs
+        }
+        for future in as_completed(futures):
+            group_index, hdf5, demo_id, split, pending = futures[future]
+            try:
+                returncode, results, stderr_tail = future.result()
+            except Exception as error:
+                returncode, results = -1, []
+                stderr_tail = [f"{type(error).__name__}: {error}"]
             if returncode == 0 and len(results) == len(pending):
                 manifest["results"].extend(results)
                 n_done += len(results)
@@ -381,16 +433,21 @@ def main() -> None:
                     flush=True,
                 )
             n_processed += len(pending)
+            completed_groups += 1
 
-        elapsed = time.time() - t_run
-        eta = (len(plan) - n_processed) * (elapsed / max(1, n_processed))
-        print(
-            f"[bulk_export] demos={group_index}/{len(groups)} clips={n_processed}/{len(plan)} "
-            f"(done={n_done} skip={n_skip} fail={n_fail}) "
-            f"elapsed={elapsed/60:.1f}min eta={eta/60:.1f}min",
-            flush=True,
-        )
-        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+            elapsed = time.time() - t_run
+            throughput = (n_processed - n_skip) / max(elapsed, 1e-6)
+            remaining = len(plan) - n_processed
+            eta = remaining / max(throughput, 1e-9)
+            print(
+                f"[bulk_export] demos={completed_groups}/{len(jobs)} "
+                f"source_group={group_index}/{len(groups)} "
+                f"clips={n_processed}/{len(plan)} "
+                f"(done={n_done} skip={n_skip} fail={n_fail}) "
+                f"elapsed={elapsed/60:.1f}min eta={eta/60:.1f}min",
+                flush=True,
+            )
+            manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"[bulk_export] DONE: done={n_done} skip={n_skip} fail={n_fail} "

@@ -119,6 +119,12 @@ def _default_argv(args: argparse.Namespace) -> list[str]:
         # checkpoint with a different domain set would otherwise load
         # with the wrong stat buffer shape.
         "--domains", ",".join(args._checkpoint_domains),
+        # Inference-only Trainer construction never opens a dataset, but the
+        # common parser still requires one data-dir entry per checkpoint
+        # domain. Supplying inert placeholders also supports downstream
+        # fine-tuned domains (for example ``libero``) that are intentionally
+        # absent from the released-domain lookup table.
+        "--data_dirs", ",".join(["/tmp"] * len(args._checkpoint_domains)),
         "--norm_stats_path", args.norm_stats_path,
         "--log_dir", str(args.log_dir),
     ]

@@ -135,6 +135,20 @@ def parse_args(skip_command_line=False):
         ),
     )
     parser.add_argument(
+        '--libero_data_root', type=str, default=None,
+        help=(
+            "Shared LIBERO NPZ pool root. Use with --libero_split_manifest; "
+            "clips may live in any subdirectories and are not copied per split."
+        ),
+    )
+    parser.add_argument(
+        '--libero_split_manifest', type=str, default=None,
+        help=(
+            "Clip-level JSON manifest whose splits.train and splits.val entries "
+            "are NPZ paths relative to --libero_data_root."
+        ),
+    )
+    parser.add_argument(
         '--libero_require_temporal_metadata', type=str, default='true',
         help=(
             "Require LIBERO NPZ clips to declare a 0.1-second model timestep. "
@@ -293,8 +307,18 @@ def parse_args(skip_command_line=False):
         args.dynamics_head_init_scale = 1.0
     else:
         args.dynamics_head_init_scale = 0.0
+    if bool(args.libero_data_root) != bool(args.libero_split_manifest):
+        raise ValueError(
+            "--libero_data_root and --libero_split_manifest must be provided together"
+        )
     # map domains to data dirs if not provided
-    if args.data_dirs is None:
+    if (
+        args.data_dirs is None
+        and args.dataset_format == "libero_npz"
+        and args.libero_data_root
+    ):
+        args.data_dirs = [args.libero_data_root]
+    elif args.data_dirs is None:
         args.data_dirs = []
         for domain in args.domains:
             args.data_dirs.append(DOMAIN_TO_DATA_DIR[domain])

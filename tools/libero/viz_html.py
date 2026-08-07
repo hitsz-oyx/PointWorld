@@ -392,7 +392,7 @@ function unpackClip(c) {
   if(c.workspace_bounds){
     const lo=c.workspace_bounds[0], hi=c.workspace_bounds[1];
     const box=new THREE.Box3(new THREE.Vector3(...lo),new THREE.Vector3(...hi));
-    c.workspaceHelper=new THREE.Box3Helper(box,0x9ccc65); c.workspaceHelper.material.transparent=true; c.workspaceHelper.material.opacity=.8; scene.add(c.workspaceHelper);
+    c.workspaceHelper=new THREE.Box3Helper(box,0x9ccc65); c.workspaceHelper.material.transparent=true; c.workspaceHelper.material.opacity=.8; c.workspaceHelper.visible=false; scene.add(c.workspaceHelper);
   }
 }
 

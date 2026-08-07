@@ -393,6 +393,26 @@ def _resolve_libero_data_dir(args, mode: str) -> str:
     return resolved
 
 
+def _resolve_libero_data_source(args, mode: str):
+    """Resolve a manifest-backed pool or fall back to a legacy split directory."""
+    manifest_path = getattr(args, "libero_split_manifest", None)
+    manifest_root = getattr(args, "libero_data_root", None)
+    if bool(manifest_path) != bool(manifest_root):
+        raise ValueError(
+            "--libero_data_root and --libero_split_manifest must be provided together"
+        )
+    file_list = None
+    if manifest_path:
+        from dataset_components.libero_manifest import load_split_files
+
+        data_dir = os.path.realpath(os.path.abspath(manifest_root))
+        split = "train" if mode == "train" else "val"
+        file_list = load_split_files(data_dir, manifest_path, split)
+    else:
+        data_dir = _resolve_libero_data_dir(args, mode)
+    return data_dir, file_list, manifest_path
+
+
 def _build_libero_dataloader(args, mode, rank=0, world_size=1):
     """Build a regular ``torch.utils.data.DataLoader`` for LIBERO .npz.
 
@@ -407,7 +427,7 @@ def _build_libero_dataloader(args, mode, rank=0, world_size=1):
     from dataset_components.libero_dataset import LiberoNPZDataset
     from dataset_components.collate import custom_collate_fn
 
-    data_dir = _resolve_libero_data_dir(args, mode)
+    data_dir, file_list, manifest_path = _resolve_libero_data_source(args, mode)
     if mode == 'train':
         num_cameras = getattr(args, 'train_max_num_cameras', 2)
     else:
@@ -421,11 +441,12 @@ def _build_libero_dataloader(args, mode, rank=0, world_size=1):
         args=args,
         num_cameras=num_cameras,
         domain=domain,
+        file_list=file_list,
     )
     if rank == 0:
         print(
             f"[{domain}] {mode} num_samples={len(dataset)} "
-            f"(data_dir={data_dir}, num_cameras={num_cameras})"
+            f"(data_dir={data_dir}, manifest={manifest_path}, num_cameras={num_cameras})"
         )
 
     # Distributed sharding: split sample indices across ranks so each

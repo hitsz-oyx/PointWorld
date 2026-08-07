@@ -33,6 +33,9 @@ Usage::
     python -m tools.libero.compute_norm_stats \\
         --data_dir /path/to/libero_pointworld/train \\
         --output stats/libero/norm_stats.json
+
+For a shared clip pool, add ``--split_manifest splits/paper.json`` and select
+the manifest split with ``--split`` (default: ``train``).
 """
 
 from __future__ import annotations
@@ -41,6 +44,7 @@ import argparse
 import json
 import sys
 import types
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
@@ -133,10 +137,70 @@ def _to_numpy(x):
     return np.asarray(x)
 
 
+def _sample_moments(
+    path: Path,
+    pipeline_args: _StatsArgs,
+    num_cameras: int,
+):
+    """Return mergeable sufficient statistics for one exported clip."""
+    try:
+        sample = _process_one(path, pipeline_args, num_cameras=num_cameras)
+        rf = _to_numpy(sample["robot_features"]).reshape(
+            -1, sample["robot_features"].shape[-1],
+        ).astype(np.float64)
+        sf = _to_numpy(sample["scene_features"]).reshape(
+            -1, sample["scene_features"].shape[-1],
+        ).astype(np.float64)
+        gt = _to_numpy(sample["gt_scene_flows_relative"]).astype(np.float64)
+        if "scene_supervised_mask" in sample:
+            mask = _to_numpy(sample["scene_supervised_mask"]).astype(bool)
+        else:
+            mask = np.ones(gt.shape[:-1], dtype=bool)
+        gt = gt.reshape(gt.shape[-3], gt.shape[-2], gt.shape[-1]) if gt.ndim == 4 else gt
+        mask = mask.reshape(mask.shape[-3], mask.shape[-2]) if mask.ndim == 4 else mask
+
+        per_t_sum = np.zeros((T_FRAMES, 3), dtype=np.float64)
+        per_t_sq = np.zeros((T_FRAMES, 3), dtype=np.float64)
+        per_t_n = np.zeros(T_FRAMES, dtype=np.int64)
+        for timestep in range(T_FRAMES):
+            valid = mask[timestep] & np.isfinite(gt[timestep]).all(axis=-1)
+            points = gt[timestep][valid]
+            if points.size:
+                per_t_sum[timestep] = points.sum(axis=0)
+                per_t_sq[timestep] = (points ** 2).sum(axis=0)
+                per_t_n[timestep] = points.shape[0]
+        return {
+            "path": str(path),
+            "error": None,
+            "robot_sum": rf.sum(axis=0),
+            "robot_sq": (rf ** 2).sum(axis=0),
+            "robot_n": rf.shape[0],
+            "scene_sum": sf.sum(axis=0),
+            "scene_sq": (sf ** 2).sum(axis=0),
+            "scene_n": sf.shape[0],
+            "per_t_sum": per_t_sum,
+            "per_t_sq": per_t_sq,
+            "per_t_n": per_t_n,
+        }
+    except Exception as error:
+        return {
+            "path": str(path),
+            "error": f"{type(error).__name__}: {error}",
+        }
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--data_dir", required=True,
-                   help="Directory of LIBERO .npz clips (recursively searched).")
+                   help="LIBERO NPZ directory or shared pool root.")
+    p.add_argument(
+        "--split_manifest", default=None,
+        help="Optional clip-level split manifest; paths are relative to --data_dir.",
+    )
+    p.add_argument(
+        "--split", default="train",
+        help="Manifest split to process when --split_manifest is set (default: train).",
+    )
     p.add_argument("--output", required=True,
                    help="Output JSON path.")
     p.add_argument("--domain", default="libero",
@@ -149,6 +213,10 @@ def _parse_args() -> argparse.Namespace:
                    help="Training scene-point cap (default: 12000).")
     p.add_argument("--max_files", type=int, default=0,
                    help="If > 0, only process the first N .npz files (smoke test).")
+    p.add_argument(
+        "--num_workers", type=int, default=1,
+        help="Processes used to compute mergeable per-clip moments (default: 1).",
+    )
     return p.parse_args()
 
 
@@ -158,7 +226,12 @@ def main() -> None:
     if not data_dir.is_dir():
         raise FileNotFoundError(data_dir)
 
-    files = sorted(data_dir.rglob("*.npz"))
+    if args.split_manifest:
+        from dataset_components.libero_manifest import load_split_files
+
+        files = load_split_files(data_dir, args.split_manifest, args.split)
+    else:
+        files = sorted(data_dir.rglob("*.npz"))
     if args.max_files > 0:
         files = files[: args.max_files]
     if not files:
@@ -170,6 +243,8 @@ def main() -> None:
         raise ValueError("--grid_size must be > 0")
     if args.max_scene_points < 1:
         raise ValueError("--max_scene_points must be >= 1")
+    if args.num_workers < 1:
+        raise ValueError("--num_workers must be >= 1")
     pipeline_args = _StatsArgs(
         grid_size=float(args.grid_size),
         max_scene_points=int(args.max_scene_points),
@@ -192,57 +267,42 @@ def main() -> None:
         f"(cameras={args.num_cameras}, grid_size={pipeline_args.grid_size}, "
         f"max_scene_points={pipeline_args.max_scene_points})"
     )
-    for i, path in enumerate(files):
-        try:
-            sample = _process_one(path, pipeline_args, num_cameras=args.num_cameras)
-        except Exception as e:
-            print(f"  [{i}] SKIP {path.name}: {type(e).__name__}: {e}")
+    worker_args = ((path, pipeline_args, args.num_cameras) for path in files)
+    if args.num_workers == 1:
+        moments = (_sample_moments(*item) for item in worker_args)
+        executor = None
+    else:
+        executor = ProcessPoolExecutor(max_workers=args.num_workers)
+        moments = executor.map(_sample_moments, files,
+                               [pipeline_args] * len(files),
+                               [args.num_cameras] * len(files))
+
+    for i, moment in enumerate(moments):
+        if moment["error"] is not None:
+            print(f"  [{i}] SKIP {Path(moment['path']).name}: {moment['error']}")
             continue
-        rf = _to_numpy(sample["robot_features"]).reshape(
-            -1, sample["robot_features"].shape[-1],
-        ).astype(np.float64)
-        sf = _to_numpy(sample["scene_features"]).reshape(
-            -1, sample["scene_features"].shape[-1],
-        ).astype(np.float64)
-        gt = _to_numpy(sample["gt_scene_flows_relative"]).astype(np.float64)
-        if "scene_supervised_mask" in sample:
-            mask = _to_numpy(sample["scene_supervised_mask"]).astype(bool)
-        else:
-            mask = np.ones(gt.shape[:-1], dtype=bool)
-        # After ``convert_to_tensors`` everything has a leading batch
-        # dim of size 1; squeeze it so we can index by (T, NS, ...).
-        rf = rf.reshape(-1, rf.shape[-1])
-        sf = sf.reshape(-1, sf.shape[-1])
-        gt = gt.reshape(gt.shape[-3], gt.shape[-2], gt.shape[-1]) if gt.ndim == 4 else gt
-        mask = mask.reshape(mask.shape[-3], mask.shape[-2]) if mask.ndim == 4 else mask
-
         if robot_sum is None:
-            robot_sum = np.zeros(rf.shape[-1], dtype=np.float64)
-            robot_sq = np.zeros(rf.shape[-1], dtype=np.float64)
-            scene_sum = np.zeros(sf.shape[-1], dtype=np.float64)
-            scene_sq = np.zeros(sf.shape[-1], dtype=np.float64)
+            robot_sum = np.zeros_like(moment["robot_sum"])
+            robot_sq = np.zeros_like(moment["robot_sq"])
+            scene_sum = np.zeros_like(moment["scene_sum"])
+            scene_sq = np.zeros_like(moment["scene_sq"])
 
-        if rf.size:
-            robot_sum += rf.sum(axis=0)
-            robot_sq += (rf ** 2).sum(axis=0)
-            robot_n += rf.shape[0]
-        if sf.size:
-            scene_sum += sf.sum(axis=0)
-            scene_sq += (sf ** 2).sum(axis=0)
-            scene_n += sf.shape[0]
-
-        for t in range(T_FRAMES):
-            valid = mask[t] & np.isfinite(gt[t]).all(axis=-1)
-            pts = gt[t][valid]
-            if pts.size == 0:
-                continue
-            per_t_sum[t] += pts.sum(axis=0)
-            per_t_sq[t] += (pts ** 2).sum(axis=0)
-            per_t_n[t] += pts.shape[0]
+        robot_sum += moment["robot_sum"]
+        robot_sq += moment["robot_sq"]
+        robot_n += moment["robot_n"]
+        scene_sum += moment["scene_sum"]
+        scene_sq += moment["scene_sq"]
+        scene_n += moment["scene_n"]
+        for timestep in range(T_FRAMES):
+            per_t_sum[timestep] += moment["per_t_sum"][timestep]
+            per_t_sq[timestep] += moment["per_t_sq"][timestep]
+            per_t_n[timestep] += int(moment["per_t_n"][timestep])
 
         if (i + 1) % 5 == 0 or i + 1 == len(files):
             print(f"  [{i + 1}/{len(files)}] processed "
                   f"(robot_n={robot_n}, scene_n={scene_n})")
+    if executor is not None:
+        executor.shutdown()
 
     if robot_n == 0 or scene_n == 0:
         raise RuntimeError("No usable features extracted; cannot compute stats.")

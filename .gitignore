@@ -151,3 +151,4 @@ environments/condaenv.*.requirements.txt
 tools/libero/_smoke_*.py
 # Per-domain normalization stats (recomputed by tools/libero/compute_norm_stats.py)
 stats/libero/
+AGENTS.md
